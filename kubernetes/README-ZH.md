@@ -107,7 +107,7 @@ BatchSandbox 与 Sig Agent-Sandbox 在吞吐量方面的性能对比测试。
 - go 版本 v1.24.0+
 - docker 版本 17.03+
 - kubectl 版本 v1.11.3+
-- 访问 Kubernetes v1.22.4+ 集群
+- 访问 Kubernetes v1.21.1+ 集群
 
 如果您没有 Kubernetes 集群的访问权限，可以使用 [kind](https://kind.sigs.k8s.io/) 创建一个本地 Kubernetes 集群进行测试。Kind 在 Docker 容器中运行 Kubernetes 节点，使得设置本地开发环境变得容易。
 

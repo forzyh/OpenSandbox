@@ -106,7 +106,7 @@ Core Difference: The time complexity of Sig Agent-Sandbox and BatchSandbox for b
 - go version v1.24.0+
 - docker version 17.03+
 - kubectl version v1.11.3+
-- Access to a Kubernetes v1.22.4+ cluster
+- Access to a Kubernetes v1.21.1+ cluster
 
 If you don't have access to a Kubernetes cluster, you can use [kind](https://kind.sigs.k8s.io/) to create a local Kubernetes cluster for testing purposes. Kind runs Kubernetes nodes in Docker containers, making it easy to set up a local development environment.
 
