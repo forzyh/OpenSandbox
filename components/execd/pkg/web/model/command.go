@@ -16,13 +16,29 @@ package model
 
 import "time"
 
-// CommandStatusResponse represents command status for REST APIs.
+// CommandStatusResponse 表示命令状态的 REST API 响应
+//
+// CommandStatusResponse 用于返回后台命令的执行状态，
+// 包括命令 ID、运行状态、退出码、时间戳等信息。
 type CommandStatusResponse struct {
-	ID         string     `json:"id"`
-	Content    string     `json:"content,omitempty"`
-	Running    bool       `json:"running"`
-	ExitCode   *int       `json:"exit_code,omitempty"`
-	Error      string     `json:"error,omitempty"`
-	StartedAt  time.Time  `json:"started_at,omitempty"`
+	// ID 命令会话 ID
+	ID string `json:"id"`
+
+	// Content 执行的命令内容
+	Content string `json:"content,omitempty"`
+
+	// Running 命令是否正在运行
+	Running bool `json:"running"`
+
+	// ExitCode 命令退出码（如果已完成）
+	ExitCode *int `json:"exit_code,omitempty"`
+
+	// Error 错误消息（如果有）
+	Error string `json:"error,omitempty"`
+
+	// StartedAt 命令开始执行的时间
+	StartedAt time.Time `json:"started_at,omitempty"`
+
+	// FinishedAt 命令执行完成的时间（如果已完成）
 	FinishedAt *time.Time `json:"finished_at,omitempty"`
 }

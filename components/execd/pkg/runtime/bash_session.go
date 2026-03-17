@@ -1,4 +1,4 @@
-// Copyright 2026 Alibaba Group Holding Ltd.
+// Copyright 2025 Alibaba Group Holding Ltd.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,452 +12,208 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//go:build !windows
-// +build !windows
-
 package runtime
 
 import (
 	"bufio"
-	"context"
-	"errors"
+	"bytes"
 	"fmt"
+	"io"
 	"os"
-	"os/exec"
-	"sort"
-	"strconv"
-	"strings"
-	"syscall"
+	"path/filepath"
+	"sync"
 	"time"
-
-	"github.com/google/uuid"
-
-	"github.com/alibaba/opensandbox/execd/pkg/jupyter/execute"
-	"github.com/alibaba/opensandbox/execd/pkg/log"
 )
 
-const (
-	envDumpStartMarker = "__ENV_DUMP_START__"
-	envDumpEndMarker   = "__ENV_DUMP_END__"
-	exitMarkerPrefix   = "__EXIT_CODE__:"
-	pwdMarkerPrefix    = "__PWD__:"
-)
+// tailStdPipe 流式读取日志文件的追加内容，直到进程结束
+//
+// 本函数定期读取日志文件的新内容并通过回调函数发送。
+// 使用 ticker 每隔 100ms 检查一次文件是否有新内容。
+//
+// 参数:
+//   - file: 日志文件路径
+//   - onExecute: 读取到新内容时的回调函数
+//   - done: 完成信号通道，用于通知停止读取
+func (c *Controller) tailStdPipe(file string, onExecute func(text string), done <-chan struct{}) {
+	lastPos := int64(0)
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
 
-func (c *Controller) createBashSession(req *CreateContextRequest) (string, error) {
-	session := newBashSession(req.Cwd)
-	if err := session.start(); err != nil {
-		return "", fmt.Errorf("failed to start bash session: %w", err)
+	mutex := &sync.Mutex{}
+	for {
+		select {
+		case <-done:
+			// 收到完成信号，读取剩余内容并返回
+			c.readFromPos(mutex, file, lastPos, onExecute, true)
+			return
+		case <-ticker.C:
+			// 定期检查新内容
+			newPos := c.readFromPos(mutex, file, lastPos, onExecute, false)
+			lastPos = newPos
+		}
 	}
-
-	c.bashSessionClientMap.Store(session.config.Session, session)
-	log.Info("created bash session %s", session.config.Session)
-	return session.config.Session, nil
 }
 
-func (c *Controller) runBashSession(ctx context.Context, request *ExecuteCodeRequest) error {
-	session := c.getBashSession(request.Context)
-	if session == nil {
-		return ErrContextNotFound
-	}
-
-	return session.run(ctx, request)
-}
-
-func (c *Controller) getBashSession(sessionId string) *bashSession {
-	if v, ok := c.bashSessionClientMap.Load(sessionId); ok {
-		if s, ok := v.(*bashSession); ok {
-			return s
+// getCommandKernel 获取命令执行上下文
+//
+// 本方法从 commandClientMap 中检索指定会话的命令内核。
+//
+// 参数:
+//   - sessionID: 会话 ID
+//
+// 返回值:
+//   - *commandKernel: 命令内核（如果不存在则返回 nil）
+func (c *Controller) getCommandKernel(sessionID string) *commandKernel {
+	if v, ok := c.commandClientMap.Load(sessionID); ok {
+		if kernel, ok := v.(*commandKernel); ok {
+			return kernel
 		}
 	}
 	return nil
 }
 
-func (c *Controller) closeBashSession(sessionId string) error {
-	session := c.getBashSession(sessionId)
-	if session == nil {
-		return ErrContextNotFound
+// storeCommandKernel 注册命令执行上下文
+//
+// 本方法将命令内核存储到 commandClientMap 中。
+//
+// 参数:
+//   - sessionID: 会话 ID
+//   - kernel: 命令内核实例
+func (c *Controller) storeCommandKernel(sessionID string, kernel *commandKernel) {
+	c.commandClientMap.Store(sessionID, kernel)
+}
+
+// stdLogDescriptor 创建用于捕获命令输出的临时文件
+//
+// 本函数为命令执行创建标准输出和标准错误的日志文件。
+// 在打开文件之前会确保临时目录存在，这样即使/tmp 目录
+// 被删除后重新创建，命令仍然可以正常工作。
+//
+// 参数:
+//   - session: 会话 ID
+//
+// 返回值:
+//   - io.WriteCloser: 标准输出文件
+//   - io.WriteCloser: 标准错误文件
+//   - error: 创建错误（如有）
+func (c *Controller) stdLogDescriptor(session string) (io.WriteCloser, io.WriteCloser, error) {
+	logDir := os.TempDir()
+	if err := os.MkdirAll(logDir, 0o755); err != nil {
+		return nil, nil, fmt.Errorf("failed to create temp dir %s: %w", logDir, err)
 	}
 
-	err := session.close()
+	stdout, err := os.OpenFile(c.stdoutFileName(session), os.O_RDWR|os.O_CREATE|os.O_TRUNC, os.ModePerm)
 	if err != nil {
-		return err
+		return nil, nil, err
 	}
-
-	c.bashSessionClientMap.Delete(sessionId)
-	return nil
-}
-
-func (c *Controller) CreateBashSession(req *CreateContextRequest) (string, error) {
-	return c.createBashSession(req)
-}
-
-func (c *Controller) RunInBashSession(ctx context.Context, req *ExecuteCodeRequest) error {
-	return c.runBashSession(ctx, req)
-}
-
-func (c *Controller) DeleteBashSession(sessionID string) error {
-	return c.closeBashSession(sessionID)
-}
-
-// Session implementation (pipe-based, no PTY)
-func newBashSession(cwd string) *bashSession {
-	config := &bashSessionConfig{
-		Session:        uuidString(),
-		StartupTimeout: 5 * time.Second,
-	}
-
-	env := make(map[string]string)
-	for _, kv := range os.Environ() {
-		if k, v, ok := splitEnvPair(kv); ok {
-			env[k] = v
-		}
-	}
-
-	return &bashSession{
-		config: config,
-		env:    env,
-		cwd:    cwd,
-	}
-}
-
-func (s *bashSession) start() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if s.started {
-		return errors.New("session already started")
-	}
-
-	s.started = true
-	return nil
-}
-
-func (s *bashSession) trackCurrentProcess(pid int) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.currentProcessPid = pid
-}
-
-func (s *bashSession) untrackCurrentProcess() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.currentProcessPid = 0
-}
-
-//nolint:gocognit
-func (s *bashSession) run(ctx context.Context, request *ExecuteCodeRequest) error {
-	s.mu.Lock()
-	if !s.started {
-		s.mu.Unlock()
-		return errors.New("session not started")
-	}
-
-	envSnapshot := copyEnvMap(s.env)
-
-	cwd := s.cwd
-	// override original cwd if specified
-	if request.Cwd != "" {
-		cwd = request.Cwd
-	}
-	sessionID := s.config.Session
-	s.mu.Unlock()
-
-	startAt := time.Now()
-	if request.Hooks.OnExecuteInit != nil {
-		request.Hooks.OnExecuteInit(sessionID)
-	}
-
-	wait := request.Timeout
-	if wait <= 0 {
-		wait = 24 * 3600 * time.Second // max to 24 hours
-	}
-
-	ctx, cancel := context.WithTimeout(ctx, wait)
-	defer cancel()
-
-	script := buildWrappedScript(request.Code, envSnapshot, cwd)
-	scriptFile, err := os.CreateTemp("", "execd_bash_*.sh")
+	stderr, err := os.OpenFile(c.stderrFileName(session), os.O_RDWR|os.O_CREATE|os.O_TRUNC, os.ModePerm)
 	if err != nil {
-		return fmt.Errorf("create script file: %w", err)
-	}
-	scriptPath := scriptFile.Name()
-	if _, err := scriptFile.WriteString(script); err != nil {
-		_ = scriptFile.Close()
-		return fmt.Errorf("write script file: %w", err)
-	}
-	if err := scriptFile.Close(); err != nil {
-		return fmt.Errorf("close script file: %w", err)
+		stdout.Close()
+		return nil, nil, err
 	}
 
-	cmd := exec.CommandContext(ctx, "bash", "--noprofile", "--norc", scriptPath)
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	// Do not pass envSnapshot via cmd.Env to avoid "argument list too long" when session env is large.
-	// Child inherits parent env (nil => default in Go). The script file already has "export K=V" for
-	// all session vars at the top, so the session environment is applied when the script runs.
-	stdout, err := cmd.StdoutPipe()
+	return stdout, stderr, nil
+}
+
+// combinedOutputDescriptor 创建用于捕获合并输出的临时文件
+//
+// 本函数为后台命令创建合并输出文件（stdout 和 stderr 合并）。
+//
+// 参数:
+//   - session: 会话 ID
+//
+// 返回值:
+//   - io.WriteCloser: 合并输出文件
+//   - error: 创建错误（如有）
+func (c *Controller) combinedOutputDescriptor(session string) (io.WriteCloser, error) {
+	logDir := os.TempDir()
+	if err := os.MkdirAll(logDir, 0o755); err != nil {
+		return nil, fmt.Errorf("failed to create temp dir %s: %w", logDir, err)
+	}
+	return os.OpenFile(c.combinedOutputFileName(session), os.O_RDWR|os.O_CREATE|os.O_TRUNC, os.ModePerm)
+}
+
+// stdoutFileName 构建标准输出日志文件路径
+func (c *Controller) stdoutFileName(session string) string {
+	return filepath.Join(os.TempDir(), session+".stdout")
+}
+
+// stderrFileName 构建标准错误日志文件路径
+func (c *Controller) stderrFileName(session string) string {
+	return filepath.Join(os.TempDir(), session+".stderr")
+}
+
+// combinedOutputFileName 构建合并输出日志文件路径
+func (c *Controller) combinedOutputFileName(session string) string {
+	return filepath.Join(os.TempDir(), session+".output")
+}
+
+// readFromPos 从文件的指定位置开始流式读取新内容
+//
+// 本函数从 startPos 位置开始读取文件内容，按行输出并通过回调函数发送。
+// 如果 flushIncomplete 为 true，则即使最后一行没有换行符也会输出。
+//
+// 参数:
+//   - mutex: 保护文件访问的互斥锁
+//   - filepath: 文件路径
+//   - startPos: 起始读取位置
+//   - onExecute: 读取到内容时的回调函数
+//   - flushIncomplete: 是否输出不完整的最后一行
+//
+// 返回值:
+//   - int64: 新的读取位置
+func (c *Controller) readFromPos(mutex *sync.Mutex, filepath string, startPos int64, onExecute func(string), flushIncomplete bool) int64 {
+	// 尝试获取锁，如果获取失败返回 -1
+	if !mutex.TryLock() {
+		return -1
+	}
+	defer mutex.Unlock()
+
+	file, err := os.Open(filepath)
 	if err != nil {
-		return fmt.Errorf("stdout pipe: %w", err)
+		return startPos
 	}
-	cmd.Stderr = cmd.Stdout
+	defer file.Close()
 
-	if err := cmd.Start(); err != nil {
-		log.Error("start bash session failed: %v (command: %q)", err, request.Code)
-		return fmt.Errorf("start bash: %w", err)
-	}
-	defer s.untrackCurrentProcess()
-	s.trackCurrentProcess(cmd.Process.Pid)
+	// 定位到起始位置
+	_, _ = file.Seek(startPos, 0)
 
-	scanner := bufio.NewScanner(stdout)
-	scanner.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
+	reader := bufio.NewReader(file)
+	var buffer bytes.Buffer
+	var currentPos int64 = startPos
 
-	var (
-		envLines []string
-		pwdLine  string
-		exitCode *int
-		inEnv    bool
-	)
-
-	for scanner.Scan() {
-		line := scanner.Text()
-		switch {
-		case line == envDumpStartMarker:
-			inEnv = true
-		case line == envDumpEndMarker:
-			inEnv = false
-		case strings.HasPrefix(line, exitMarkerPrefix):
-			if code, err := strconv.Atoi(strings.TrimPrefix(line, exitMarkerPrefix)); err == nil {
-				exitCode = &code //nolint:ineffassign
+	for {
+		b, err := reader.ReadByte()
+		if err != nil {
+			if err == io.EOF {
+				// 如果缓冲区有内容但没有换行符，根据 flushIncomplete 决定是否输出
+				if flushIncomplete && buffer.Len() > 0 {
+					onExecute(buffer.String())
+					buffer.Reset()
+				}
 			}
-		case strings.HasPrefix(line, pwdMarkerPrefix):
-			pwdLine = strings.TrimPrefix(line, pwdMarkerPrefix)
-		default:
-			if inEnv {
-				envLines = append(envLines, line)
-				continue
+			break
+		}
+		currentPos++
+
+		// 检查是否是行结束符
+		if b == '\n' || b == '\r' {
+			// 如果缓冲区有内容，输出这一行
+			if buffer.Len() > 0 {
+				onExecute(buffer.String())
+				buffer.Reset()
 			}
-			if request.Hooks.OnExecuteStdout != nil {
-				request.Hooks.OnExecuteStdout(line)
-			}
-		}
-	}
-
-	scanErr := scanner.Err()
-	waitErr := cmd.Wait()
-
-	if scanErr != nil {
-		log.Error("read stdout failed: %v (command: %q)", scanErr, request.Code)
-		return fmt.Errorf("read stdout: %w", scanErr)
-	}
-
-	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-		log.Error("timeout after %s while running command: %q", wait, request.Code)
-		return fmt.Errorf("timeout after %s while running command %q", wait, request.Code)
-	}
-
-	if exitCode == nil && cmd.ProcessState != nil {
-		code := cmd.ProcessState.ExitCode() //nolint:staticcheck
-		exitCode = &code                    //nolint:ineffassign
-	}
-
-	updatedEnv := parseExportDump(envLines)
-	s.mu.Lock()
-	if len(updatedEnv) > 0 {
-		s.env = updatedEnv
-	}
-	if pwdLine != "" {
-		s.cwd = pwdLine
-	}
-	s.mu.Unlock()
-
-	var exitErr *exec.ExitError
-	if waitErr != nil && !errors.As(waitErr, &exitErr) {
-		log.Error("command wait failed: %v (command: %q)", waitErr, request.Code)
-		return waitErr
-	}
-
-	userExitCode := 0
-	if exitCode != nil {
-		userExitCode = *exitCode
-	}
-
-	if userExitCode != 0 {
-		errMsg := fmt.Sprintf("command exited with code %d", userExitCode)
-		if waitErr != nil {
-			errMsg = waitErr.Error()
-		}
-		if request.Hooks.OnExecuteError != nil {
-			request.Hooks.OnExecuteError(&execute.ErrorOutput{
-				EName:     "CommandExecError",
-				EValue:    strconv.Itoa(userExitCode),
-				Traceback: []string{errMsg},
-			})
-		}
-		log.Error("CommandExecError: %s (command: %q)", errMsg, request.Code)
-		return nil
-	}
-
-	if request.Hooks.OnExecuteComplete != nil {
-		request.Hooks.OnExecuteComplete(time.Since(startAt))
-	}
-
-	return nil
-}
-
-func buildWrappedScript(command string, env map[string]string, cwd string) string {
-	var b strings.Builder
-
-	keys := make([]string, 0, len(env))
-	for k := range env {
-		v := env[k]
-		if isValidEnvKey(k) && !envKeysNotPersisted[k] && len(v) <= maxPersistedEnvValueSize {
-			keys = append(keys, k)
-		}
-	}
-	sort.Strings(keys)
-	for _, k := range keys {
-		b.WriteString("export ")
-		b.WriteString(k)
-		b.WriteString("=")
-		b.WriteString(shellEscape(env[k]))
-		b.WriteString("\n")
-	}
-
-	if cwd != "" {
-		b.WriteString("cd ")
-		b.WriteString(shellEscape(cwd))
-		b.WriteString("\n")
-	}
-
-	b.WriteString(command)
-	if !strings.HasSuffix(command, "\n") {
-		b.WriteString("\n")
-	}
-
-	b.WriteString("__USER_EXIT_CODE__=$?\n")
-	b.WriteString("printf \"\\n%s\\n\" \"" + envDumpStartMarker + "\"\n")
-	b.WriteString("export -p\n")
-	b.WriteString("printf \"%s\\n\" \"" + envDumpEndMarker + "\"\n")
-	b.WriteString("printf \"" + pwdMarkerPrefix + "%s\\n\" \"$(pwd)\"\n")
-	b.WriteString("printf \"" + exitMarkerPrefix + "%s\\n\" \"$__USER_EXIT_CODE__\"\n")
-	b.WriteString("exit \"$__USER_EXIT_CODE__\"\n")
-
-	return b.String()
-}
-
-// envKeysNotPersisted are not carried across runs (prompt/display vars).
-var envKeysNotPersisted = map[string]bool{
-	"PS1": true, "PS2": true, "PS3": true, "PS4": true,
-	"PROMPT_COMMAND": true,
-}
-
-// maxPersistedEnvValueSize caps single env value length as a safeguard.
-const maxPersistedEnvValueSize = 8 * 1024
-
-func parseExportDump(lines []string) map[string]string {
-	if len(lines) == 0 {
-		return nil
-	}
-	env := make(map[string]string, len(lines))
-	for _, line := range lines {
-		k, v, ok := parseExportLine(line)
-		if !ok || envKeysNotPersisted[k] || len(v) > maxPersistedEnvValueSize {
+			// 跳过年结束符
 			continue
 		}
-		env[k] = v
-	}
-	return env
-}
 
-func parseExportLine(line string) (string, string, bool) {
-	const prefix = "declare -x "
-	if !strings.HasPrefix(line, prefix) {
-		return "", "", false
-	}
-	rest := strings.TrimSpace(strings.TrimPrefix(line, prefix))
-	if rest == "" {
-		return "", "", false
-	}
-	name, value := rest, ""
-	if eq := strings.Index(rest, "="); eq >= 0 {
-		name = rest[:eq]
-		raw := rest[eq+1:]
-		if unquoted, err := strconv.Unquote(raw); err == nil {
-			value = unquoted
-		} else {
-			value = strings.Trim(raw, `"`)
-		}
-	}
-	if !isValidEnvKey(name) {
-		return "", "", false
-	}
-	return name, value, true
-}
-
-func shellEscape(value string) string {
-	return "'" + strings.ReplaceAll(value, "'", `'"'"'`) + "'"
-}
-
-func isValidEnvKey(key string) bool {
-	if key == "" {
-		return false
+		buffer.WriteByte(b)
 	}
 
-	for i, r := range key {
-		if i == 0 {
-			if (r < 'A' || (r > 'Z' && r < 'a') || r > 'z') && r != '_' {
-				return false
-			}
-			continue
-		}
-		if (r < 'A' || (r > 'Z' && r < 'a') || r > 'z') && (r < '0' || r > '9') && r != '_' {
-			return false
-		}
+	endPos, _ := file.Seek(0, 1)
+	// 如果最后读取的位置没有以换行符结束，返回缓冲区起始位置，等待下次刷新
+	if !flushIncomplete && buffer.Len() > 0 {
+		return currentPos - int64(buffer.Len())
 	}
-
-	return true
-}
-
-func copyEnvMap(src map[string]string) map[string]string {
-	if src == nil {
-		return map[string]string{}
-	}
-
-	dst := make(map[string]string, len(src))
-	for k, v := range src {
-		dst[k] = v
-	}
-	return dst
-}
-
-func splitEnvPair(kv string) (string, string, bool) {
-	parts := strings.SplitN(kv, "=", 2)
-	if len(parts) != 2 {
-		return "", "", false
-	}
-	if !isValidEnvKey(parts[0]) {
-		return "", "", false
-	}
-	return parts[0], parts[1], true
-}
-
-func (s *bashSession) close() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	pid := s.currentProcessPid
-	s.currentProcessPid = 0
-	s.started = false
-	s.env = nil
-	s.cwd = ""
-
-	if pid != 0 {
-		if err := syscall.Kill(-pid, syscall.SIGKILL); err != nil {
-			log.Warning("kill session process group %d: %v (process may have already exited)", pid, err)
-		}
-	}
-	return nil
-}
-
-func uuidString() string {
-	return uuid.New().String()
+	return endPos
 }

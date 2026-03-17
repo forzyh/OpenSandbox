@@ -13,10 +13,33 @@
 # limitations under the License.
 
 """
-Factory for creating sandbox service instances.
+沙箱服务工厂模块。
 
-This module provides a factory function to create sandbox service implementations
-based on application configuration loaded from sandbox_server.config.
+本模块提供工厂函数，用于根据应用配置创建相应的沙箱服务实现实例。
+工厂模式的好处：
+1. 解耦：调用者不需要知道具体的实现类
+2. 可扩展：添加新的实现时只需修改工厂函数
+3. 配置驱动：服务类型由配置文件决定，无需修改代码
+
+支持的服务类型：
+- docker: 使用 Docker 容器作为沙箱运行时
+- kubernetes: 使用 Kubernetes 工作负载作为沙箱运行时
+
+未来可以添加的实现：
+- containerd: 使用 containerd 作为运行时
+- podman: 使用 Podman 作为运行时
+- 其他容器运行时
+
+使用示例：
+    # 基本用法（从全局配置读取）
+    service = create_sandbox_service()
+
+    # 指定服务类型（覆盖配置）
+    service = create_sandbox_service(service_type="docker")
+
+    # 使用自定义配置
+    config = load_config("/path/to/config.toml")
+    service = create_sandbox_service(config=config)
 """
 
 import logging
@@ -35,38 +58,67 @@ def create_sandbox_service(
     config: Optional[AppConfig] = None,
 ) -> SandboxService:
     """
-    Create a sandbox service instance based on configuration.
+    根据配置创建沙箱服务实例。
+
+    工厂函数根据配置或指定的服务类型返回相应的沙箱服务实现。
+    支持的服务类型在 `implementations` 字典中定义。
+
+    创建流程：
+    1. 确定配置：使用提供的配置或全局配置
+    2. 确定服务类型：使用指定的类型或配置中的类型
+    3. 查找实现类：从注册表中查找对应的实现类
+    4. 创建实例：实例化实现类并返回
 
     Args:
-        service_type: Optional override for service implementation type.
-        config: Optional application configuration. Defaults to global config.
+        service_type: 可选的服务实现类型覆盖，如 "docker" 或 "kubernetes"。
+                      如果未提供，使用配置中的 runtime.type。
+        config: 可选的应用配置。如果未提供，使用全局配置。
 
     Returns:
-        SandboxService: An instance of the configured sandbox service implementation.
+        SandboxService: 配置的沙箱服务实现实例
 
     Raises:
-        ValueError: If the configured service type is not supported.
+        ValueError: 如果配置的服务类型不受支持
+
+    Examples:
+        # 使用全局配置创建服务
+        >>> service = create_sandbox_service()
+
+        # 覆盖服务类型
+        >>> service = create_sandbox_service(service_type="docker")
+
+        # 使用自定义配置
+        >>> config = load_config("/path/to/config.toml")
+        >>> service = create_sandbox_service(config=config)
     """
+    # 使用提供的配置或获取全局配置
     active_config = config or get_config()
+    # 确定服务类型：参数覆盖 > 配置中的类型，转换为小写进行比较
     selected_type = (service_type or active_config.runtime.type).lower()
 
-    logger.info("Creating sandbox service with type: %s", selected_type)
+    logger.info("创建沙箱服务，类型：%s", selected_type)
 
-    # Service implementation registry
-    # Add new implementations here as they are created
+    # 服务实现注册表
+    # 键：服务类型名称（小写）
+    # 值：对应的服务实现类
+    # 添加新的实现时在此处注册
     implementations: dict[str, type[SandboxService]] = {
         "docker": DockerSandboxService,
         "kubernetes": KubernetesSandboxService,
-        # Future implementations can be added here:
+        # 未来的实现可以添加在这里：
         # "containerd": ContainerdSandboxService,
+        # "podman": PodmanSandboxService,
     }
 
+    # 检查服务类型是否受支持
     if selected_type not in implementations:
+        # 构建受支持类型的列表，用于错误消息
         supported_types = ", ".join(implementations.keys())
         raise ValueError(
-            f"Unsupported sandbox service type: {selected_type}. "
-            f"Supported types: {supported_types}"
+            f"不支持的沙箱服务类型：{selected_type}。"
+            f"受支持的类型：{supported_types}"
         )
 
+    # 获取实现类并创建实例
     implementation_class = implementations[selected_type]
     return implementation_class(config=active_config)

@@ -26,7 +26,10 @@ import (
 	"github.com/alibaba/opensandbox/execd/pkg/web/model"
 )
 
-// UploadFile uploads files with metadata to specified paths
+// UploadFile 上传文件及其元数据
+//
+// 本接口支持通过 multipart/form-data 上传文件，
+// 每个文件需附带对应的元数据（路径和权限）。
 func (c *FilesystemController) UploadFile() {
 	form, err := c.ctx.MultipartForm()
 	if err != nil || form == nil {
@@ -68,6 +71,7 @@ func (c *FilesystemController) UploadFile() {
 		return
 	}
 
+	// 处理每个文件及其元数据
 	for i := range metadataParts {
 		metadataHeader := metadataParts[i]
 		metadataFile, err := metadataHeader.Open()
@@ -111,6 +115,7 @@ func (c *FilesystemController) UploadFile() {
 			return
 		}
 
+		// 创建目标目录
 		targetDir := filepath.Dir(targetPath)
 		if err := os.MkdirAll(targetDir, os.ModePerm); err != nil {
 			c.RespondError(
@@ -143,6 +148,7 @@ func (c *FilesystemController) UploadFile() {
 			return
 		}
 
+		// 复制文件内容
 		if _, err := io.Copy(dst, file); err != nil {
 			dst.Close()
 			file.Close()
@@ -162,6 +168,7 @@ func (c *FilesystemController) UploadFile() {
 		}
 		file.Close()
 
+		// 设置文件权限
 		if err := ChmodFile(targetPath, meta.Permission); err != nil {
 			c.RespondError(
 				http.StatusInternalServerError,

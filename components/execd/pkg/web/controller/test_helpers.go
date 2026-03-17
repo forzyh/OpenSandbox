@@ -21,6 +21,20 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
+// newTestContext 创建测试用的 Gin 上下文
+//
+// 本函数用于单元测试，创建一个模拟的 HTTP 请求和响应记录器，
+// 并返回配置好的 Gin 上下文。
+//
+// 参数:
+//   - method: HTTP 方法（如 "GET"、"POST"）
+//   - path: 请求路径
+//   - body: 请求体内容
+//
+// 返回值:
+//   - *gin.Context: 测试上下文
+//   - *httptest.ResponseRecorder: 响应记录器
+//
 // nolint:unused
 func newTestContext(method, path string, body []byte) (*gin.Context, *httptest.ResponseRecorder) {
 	gin.SetMode(gin.TestMode)

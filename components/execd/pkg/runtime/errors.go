@@ -16,4 +16,11 @@ package runtime
 
 import "errors"
 
+// ErrContextNotFound 表示执行上下文未找到的错误
+//
+// 当尝试操作一个不存在的会话或上下文时，返回此错误。
+// 常见场景包括：
+//   - 使用无效的会话 ID 执行代码
+//   - 删除已经不存在的会话
+//   - 查询不存在的上下文信息
 var ErrContextNotFound = errors.New("context not found")

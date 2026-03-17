@@ -12,7 +12,24 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""File operation commands: cat, write, upload, download, rm, mv, mkdir, rmdir, search, info, chmod, replace."""
+"""文件操作相关命令的实现模块。
+
+本模块实现了在沙盒中进行文件操作的相關 CLI 命令，包括：
+1. cat: 读取文件内容
+2. write: 写入文件内容
+3. upload: 上传本地文件到沙盒
+4. download: 从沙盒下载文件到本地
+5. rm: 删除文件
+6. mv: 移动/重命名文件
+7. mkdir: 创建目录
+8. rmdir: 删除目录
+9. search: 搜索文件
+10. info: 获取文件/目录信息
+11. chmod: 设置文件权限
+12. replace: 替换文件内容
+
+这些命令提供了完整的文件系统操作能力，方便用户管理沙盒中的文件。
+"""
 
 from __future__ import annotations
 
@@ -28,21 +45,41 @@ from opensandbox_cli.utils import handle_errors
 @click.group("file", invoke_without_command=True)
 @click.pass_context
 def file_group(ctx: click.Context) -> None:
-    """File operations on a sandbox."""
+    """文件操作命令组入口。
+
+    当没有指定子命令时，显示帮助信息。
+
+    使用示例：
+        osb file --help              # 查看帮助
+        osb file cat sb-1 /etc/hosts # 查看文件内容
+        osb file upload sb-1 ./local.txt /remote.txt  # 上传文件
+    """
     if ctx.invoked_subcommand is None:
         click.echo(ctx.get_help())
 
 
 # ---- cat (read) -----------------------------------------------------------
 
-@file_group.command("cat")
+@click.command("cat")
 @click.argument("sandbox_id")
 @click.argument("path")
-@click.option("--encoding", default="utf-8", help="File encoding.")
+@click.option("--encoding", default="utf-8", help="文件编码格式。")
 @click.pass_obj
 @handle_errors
 def file_cat(obj: ClientContext, sandbox_id: str, path: str, encoding: str) -> None:
-    """Read a file from the sandbox."""
+    """读取沙盒中的文件内容。
+
+    将指定文件的内容输出到标准输出。
+
+    参数：
+        sandbox_id: 沙盒 ID
+        path: 文件路径
+        encoding: 文件编码（默认 utf-8）
+
+    使用示例：
+        osb file cat sb-1 /etc/hostname
+        osb file cat sb-1 /app/config.json --encoding utf-8
+    """
     sandbox = obj.connect_sandbox(sandbox_id)
     try:
         content = sandbox.files.read_file(path, encoding=encoding)
@@ -53,14 +90,14 @@ def file_cat(obj: ClientContext, sandbox_id: str, path: str, encoding: str) -> N
 
 # ---- write ----------------------------------------------------------------
 
-@file_group.command("write")
+@click.command("write")
 @click.argument("sandbox_id")
 @click.argument("path")
-@click.option("--content", "-c", default=None, help="Content to write. Reads from stdin if not provided.")
-@click.option("--encoding", default="utf-8", help="File encoding.")
-@click.option("--mode", default=None, help="File permission mode (e.g. 0644).")
-@click.option("--owner", default=None, help="File owner.")
-@click.option("--group", default=None, help="File group.")
+@click.option("--content", "-c", default=None, help="要写入的内容。如未提供则从 stdin 读取。")
+@click.option("--encoding", default="utf-8", help="文件编码格式。")
+@click.option("--mode", default=None, help="文件权限模式（如 0644）。")
+@click.option("--owner", default=None, help="文件所有者。")
+@click.option("--group", default=None, help="文件所属组。")
 @click.pass_obj
 @handle_errors
 def file_write(
@@ -73,7 +110,29 @@ def file_write(
     owner: str | None,
     group: str | None,
 ) -> None:
-    """Write content to a file in the sandbox."""
+    """向沙盒中的文件写入内容。
+
+    创建新文件或覆盖已有文件的内容。支持设置文件权限、所有者等属性。
+
+    参数：
+        sandbox_id: 沙盒 ID
+        path: 目标文件路径
+        content: 要写入的内容（可选，默认从 stdin 读取）
+        encoding: 文件编码（默认 utf-8）
+        mode: 权限模式（可选）
+        owner: 所有者（可选）
+        group: 所属组（可选）
+
+    使用示例：
+        # 直接指定内容
+        osb file write sb-1 /tmp/test.txt -c "hello world"
+
+        # 从 stdin 读取内容
+        echo "hello" | osb file write sb-1 /tmp/test.txt
+
+        # 设置权限
+        osb file write sb-1 /app/script.sh -c "#!/bin/bash" --mode 0755
+    """
     if content is None:
         if sys.stdin.isatty():
             click.echo("Reading from stdin (Ctrl+D to finish):", err=True)
@@ -96,7 +155,7 @@ def file_write(
 
 # ---- upload ---------------------------------------------------------------
 
-@file_group.command("upload")
+@click.command("upload")
 @click.argument("sandbox_id")
 @click.argument("local_path", type=click.Path(exists=True))
 @click.argument("remote_path")
@@ -105,7 +164,19 @@ def file_write(
 def file_upload(
     obj: ClientContext, sandbox_id: str, local_path: str, remote_path: str
 ) -> None:
-    """Upload a local file to the sandbox."""
+    """上传本地文件到沙盒。
+
+    将本地文件复制到沙盒中的指定路径。
+
+    参数：
+        sandbox_id: 沙盒 ID
+        local_path: 本地文件路径（必须存在）
+        remote_path: 沙盒中的目标路径
+
+    使用示例：
+        osb file upload sb-1 ./config.json /app/config.json
+        osb file upload sb-1 /home/user/data.csv /workspace/data.csv
+    """
     data = Path(local_path).read_bytes()
     sandbox = obj.connect_sandbox(sandbox_id)
     try:
@@ -117,7 +188,7 @@ def file_upload(
 
 # ---- download -------------------------------------------------------------
 
-@file_group.command("download")
+@click.command("download")
 @click.argument("sandbox_id")
 @click.argument("remote_path")
 @click.argument("local_path", type=click.Path())
@@ -126,7 +197,19 @@ def file_upload(
 def file_download(
     obj: ClientContext, sandbox_id: str, remote_path: str, local_path: str
 ) -> None:
-    """Download a file from the sandbox to local disk."""
+    """从沙盒下载文件到本地。
+
+    将沙盒中的文件复制到本地指定路径。
+
+    参数：
+        sandbox_id: 沙盒 ID
+        remote_path: 沙盒中的源文件路径
+        local_path: 本地目标路径
+
+    使用示例：
+        osb file download sb-1 /app/output.txt ./output.txt
+        osb file download sb-1 /workspace/result.zip /tmp/result.zip
+    """
     sandbox = obj.connect_sandbox(sandbox_id)
     try:
         content = sandbox.files.read_bytes(remote_path)
@@ -138,13 +221,27 @@ def file_download(
 
 # ---- rm (delete) ----------------------------------------------------------
 
-@file_group.command("rm")
+@click.command("rm")
 @click.argument("sandbox_id")
 @click.argument("paths", nargs=-1, required=True)
 @click.pass_obj
 @handle_errors
 def file_rm(obj: ClientContext, sandbox_id: str, paths: tuple[str, ...]) -> None:
-    """Delete files from the sandbox."""
+    """删除沙盒中的文件。
+
+    支持一次删除多个文件。
+
+    参数：
+        sandbox_id: 沙盒 ID
+        paths: 要删除的文件路径列表
+
+    使用示例：
+        # 删除单个文件
+        osb file rm sb-1 /tmp/test.txt
+
+        # 删除多个文件
+        osb file rm sb-1 /tmp/a.txt /tmp/b.txt /tmp/c.txt
+    """
     sandbox = obj.connect_sandbox(sandbox_id)
     try:
         sandbox.files.delete_files(list(paths))
@@ -156,7 +253,7 @@ def file_rm(obj: ClientContext, sandbox_id: str, paths: tuple[str, ...]) -> None
 
 # ---- mv (move) ------------------------------------------------------------
 
-@file_group.command("mv")
+@click.command("mv")
 @click.argument("sandbox_id")
 @click.argument("source")
 @click.argument("destination")
@@ -165,7 +262,22 @@ def file_rm(obj: ClientContext, sandbox_id: str, paths: tuple[str, ...]) -> None
 def file_mv(
     obj: ClientContext, sandbox_id: str, source: str, destination: str
 ) -> None:
-    """Move/rename a file in the sandbox."""
+    """移动或重命名沙盒中的文件。
+
+    将文件从源路径移动到目标路径，可用于移动文件或重命名文件。
+
+    参数：
+        sandbox_id: 沙盒 ID
+        source: 源文件路径
+        destination: 目标文件路径
+
+    使用示例：
+        # 移动文件
+        osb file mv sb-1 /tmp/old.txt /app/new.txt
+
+        # 重命名文件
+        osb file mv sb-1 /app/config.json /app/config.json.bak
+    """
     from opensandbox.models.filesystem import MoveEntry
 
     sandbox = obj.connect_sandbox(sandbox_id)
@@ -178,12 +290,12 @@ def file_mv(
 
 # ---- mkdir ----------------------------------------------------------------
 
-@file_group.command("mkdir")
+@click.command("mkdir")
 @click.argument("sandbox_id")
 @click.argument("paths", nargs=-1, required=True)
-@click.option("--mode", default=None, help="Directory permission mode.")
-@click.option("--owner", default=None, help="Directory owner.")
-@click.option("--group", default=None, help="Directory group.")
+@click.option("--mode", default=None, help="目录权限模式。")
+@click.option("--owner", default=None, help="目录所有者。")
+@click.option("--group", default=None, help="目录所属组。")
 @click.pass_obj
 @handle_errors
 def file_mkdir(
@@ -194,7 +306,27 @@ def file_mkdir(
     owner: str | None,
     group: str | None,
 ) -> None:
-    """Create directories in the sandbox."""
+    """在沙盒中创建目录。
+
+    支持一次创建多个目录，可指定权限、所有者等属性。
+
+    参数：
+        sandbox_id: 沙盒 ID
+        paths: 要创建的目录路径列表
+        mode: 权限模式（可选）
+        owner: 所有者（可选）
+        group: 所属组（可选）
+
+    使用示例：
+        # 创建单个目录
+        osb file mkdir sb-1 /app/logs
+
+        # 创建多个目录
+        osb file mkdir sb-1 /app/logs /app/data /app/config
+
+        # 指定权限
+        osb file mkdir sb-1 /app/data --mode 0755
+    """
     from opensandbox.models.filesystem import WriteEntry
 
     sandbox = obj.connect_sandbox(sandbox_id)
@@ -218,13 +350,24 @@ def file_mkdir(
 
 # ---- rmdir ----------------------------------------------------------------
 
-@file_group.command("rmdir")
+@click.command("rmdir")
 @click.argument("sandbox_id")
 @click.argument("paths", nargs=-1, required=True)
 @click.pass_obj
 @handle_errors
 def file_rmdir(obj: ClientContext, sandbox_id: str, paths: tuple[str, ...]) -> None:
-    """Delete directories from the sandbox."""
+    """删除沙盒中的目录。
+
+    支持一次删除多个目录。目录必须为空才能删除。
+
+    参数：
+        sandbox_id: 沙盒 ID
+        paths: 要删除的目录路径列表
+
+    使用示例：
+        osb file rmdir sb-1 /tmp/empty_dir
+        osb file rmdir sb-1 /app/old_logs /app/old_data
+    """
     sandbox = obj.connect_sandbox(sandbox_id)
     try:
         sandbox.files.delete_directories(list(paths))
@@ -236,16 +379,31 @@ def file_rmdir(obj: ClientContext, sandbox_id: str, paths: tuple[str, ...]) -> N
 
 # ---- search ---------------------------------------------------------------
 
-@file_group.command("search")
+@click.command("search")
 @click.argument("sandbox_id")
 @click.argument("path")
-@click.option("--pattern", "-p", required=True, help="Glob pattern to search for.")
+@click.option("--pattern", "-p", required=True, help="要搜索的 glob 模式。")
 @click.pass_obj
 @handle_errors
 def file_search(
     obj: ClientContext, sandbox_id: str, path: str, pattern: str
 ) -> None:
-    """Search for files in the sandbox."""
+    """在沙盒中搜索文件。
+
+    使用 glob 模式在指定目录下搜索匹配的文件。
+
+    参数：
+        sandbox_id: 沙盒 ID
+        path: 搜索的起始目录
+        pattern: glob 搜索模式（如 *.py, **/*.txt）
+
+    使用示例：
+        # 搜索所有 Python 文件
+        osb file search sb-1 /app -p "*.py"
+
+        # 递归搜索所有文本文件
+        osb file search sb-1 /workspace -p "**/*.txt"
+    """
     from opensandbox.models.filesystem import SearchEntry
 
     sandbox = obj.connect_sandbox(sandbox_id)
@@ -262,13 +420,24 @@ def file_search(
 
 # ---- info (stat) ----------------------------------------------------------
 
-@file_group.command("info")
+@click.command("info")
 @click.argument("sandbox_id")
 @click.argument("paths", nargs=-1, required=True)
 @click.pass_obj
 @handle_errors
 def file_info(obj: ClientContext, sandbox_id: str, paths: tuple[str, ...]) -> None:
-    """Get file/directory info."""
+    """获取文件/目录的详细信息。
+
+    显示文件或目录的元数据，包括大小、权限、所有者、修改时间等。
+
+    参数：
+        sandbox_id: 沙盒 ID
+        paths: 要查询的路径列表
+
+    使用示例：
+        osb file info sb-1 /etc/hosts
+        osb file info sb-1 /app /workspace
+    """
     sandbox = obj.connect_sandbox(sandbox_id)
     try:
         info_map = sandbox.files.get_file_info(list(paths))
@@ -283,12 +452,12 @@ def file_info(obj: ClientContext, sandbox_id: str, paths: tuple[str, ...]) -> No
 
 # ---- chmod ----------------------------------------------------------------
 
-@file_group.command("chmod")
+@click.command("chmod")
 @click.argument("sandbox_id")
 @click.argument("path")
-@click.option("--mode", required=True, help="Permission mode (e.g. 0755).")
-@click.option("--owner", default=None, help="File owner.")
-@click.option("--group", default=None, help="File group.")
+@click.option("--mode", required=True, help="权限模式（如 0755）。")
+@click.option("--owner", default=None, help="文件所有者。")
+@click.option("--group", default=None, help="文件所属组。")
 @click.pass_obj
 @handle_errors
 def file_chmod(
@@ -299,7 +468,27 @@ def file_chmod(
     owner: str | None,
     group: str | None,
 ) -> None:
-    """Set file permissions."""
+    """设置文件权限。
+
+    修改文件的权限模式、所有者或所属组。
+
+    参数：
+        sandbox_id: 沙盒 ID
+        path: 文件路径
+        mode: 权限模式（如 0644, 0755）
+        owner: 新所有者（可选）
+        group: 新所属组（可选）
+
+    使用示例：
+        # 设置执行权限
+        osb file chmod sb-1 /app/script.sh --mode 0755
+
+        # 设置读写权限
+        osb file chmod sb-1 /app/config.json --mode 0644
+
+        # 同时修改所有者
+        osb file chmod sb-1 /app/data --mode 0644 --owner root --group root
+    """
     from opensandbox.models.filesystem import SetPermissionEntry
 
     sandbox = obj.connect_sandbox(sandbox_id)
@@ -314,17 +503,33 @@ def file_chmod(
 
 # ---- replace --------------------------------------------------------------
 
-@file_group.command("replace")
+@click.command("replace")
 @click.argument("sandbox_id")
 @click.argument("path")
-@click.option("--old", required=True, help="Text to search for.")
-@click.option("--new", required=True, help="Replacement text.")
+@click.option("--old", required=True, help="要搜索的文本。")
+@click.option("--new", required=True, help="替换文本。")
 @click.pass_obj
 @handle_errors
 def file_replace(
     obj: ClientContext, sandbox_id: str, path: str, old: str, new: str
 ) -> None:
-    """Replace content in a file."""
+    """替换文件中的内容。
+
+    在指定文件中搜索并替换文本内容。
+
+    参数：
+        sandbox_id: 沙盒 ID
+        path: 文件路径
+        old: 要搜索的原文本
+        new: 替换后的新文本
+
+    使用示例：
+        # 替换配置文件中的地址
+        osb file replace sb-1 /app/config.json --old "localhost" --new "example.com"
+
+        # 修复代码中的拼写错误
+        osb file replace sb-1 /app/main.py --old "fucntion" --new "function"
+    """
     from opensandbox.models.filesystem import ContentReplaceEntry
 
     sandbox = obj.connect_sandbox(sandbox_id)

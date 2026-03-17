@@ -13,10 +13,25 @@
 # limitations under the License.
 
 """
-Pydantic schemas for OpenSandbox Lifecycle API.
+OpenSandbox 生命周期 API 的 Pydantic 数据模型定义。
 
-This module defines data models based on the OpenAPI specification
-for request/response validation and serialization.
+本模块定义了所有 API 请求和响应使用的数据模型，基于 OpenAPI 规范。
+这些模型用于：
+1. 请求数据验证：确保客户端发送的数据符合预期格式
+2. 响应数据序列化：确保服务器返回的数据格式一致
+3. API 文档生成：FastAPI 使用这些模型自动生成 OpenAPI 文档
+
+模型分类：
+- 镜像规格（ImageSpec）：定义容器镜像及其认证信息
+- 资源限制（ResourceLimits）：定义 CPU、内存等资源约束
+- 网络策略（NetworkPolicy）：定义出站网络访问规则
+- 卷配置（Volume）：定义存储挂载配置，支持多种后端类型
+- 沙箱模型（Sandbox）：沙箱的完整表示
+- 沙箱状态（SandboxStatus）：沙箱的生命周期状态
+- 列表和分页（ListSandboxesRequest/Response）：分页查询相关
+- 过期时间管理（RenewSandboxExpirationRequest/Response）：续期相关
+- 端点（Endpoint）：沙箱服务访问端点
+- 错误响应（ErrorResponse）：统一错误响应格式
 """
 
 from datetime import datetime
@@ -26,43 +41,76 @@ from pydantic import BaseModel, Field, RootModel, model_validator
 
 
 # ============================================================================
-# Image Specification
+# 镜像规格（Image Specification）
 # ============================================================================
 
 class ImageAuth(BaseModel):
     """
-    Registry authentication credentials for private container registries.
+    私有容器注册表的认证凭证。
+
+    当使用需要认证的私有容器镜像时，需要提供用户名和密码。
+    这些信息会在拉取镜像时传递给 Docker 或 Kubernetes。
+
+    Attributes:
+        username: 注册表用户名或服务账户名
+        password: 注册表密码或认证令牌（如访问令牌）
     """
-    username: str = Field(..., description="Registry username or service account")
-    password: str = Field(..., description="Registry password or authentication token")
+    username: str = Field(..., description="注册表用户名或服务账户")
+    password: str = Field(..., description="注册表密码或认证令牌")
 
 
 class ImageSpec(BaseModel):
     """
-    Container image specification for sandbox provisioning.
+    沙箱配置的容器镜像规格。
 
-    Supports public registry images and private registry images with authentication.
+    支持两种镜像来源：
+    1. 公共注册表镜像：如 "python:3.11"、"nginx:latest"，无需认证
+    2. 私有注册表镜像：如 "gcr.io/my-project/app:v1.0"，需要提供 auth 认证信息
+
+    Examples:
+        # 公共镜像
+        ImageSpec(uri="python:3.11")
+
+        # 私有镜像
+        ImageSpec(
+            uri="gcr.io/my-project/app:v1.0",
+            auth=ImageAuth(username="my-user", password="my-token")
+        )
+
+    Attributes:
+        uri: 容器镜像 URI，使用标准格式（如 'python:3.11'、'gcr.io/my-project/app:v1.0'）
+        auth: 注册表认证凭证（私有注册表必需）
     """
     uri: str = Field(
         ...,
-        description="Container image URI in standard format (e.g., 'python:3.11', 'gcr.io/my-project/app:v1.0')",
+        description="容器镜像 URI，使用标准格式（如 'python:3.11'、'gcr.io/my-project/app:v1.0'）",
     )
     auth: Optional[ImageAuth] = Field(
         None,
-        description="Registry authentication credentials (required for private registries)",
+        description="注册表认证凭证（私有注册表必需）",
     )
 
 
 # ============================================================================
-# Resource Limits
+# 资源限制（Resource Limits）
 # ============================================================================
 
 class ResourceLimits(RootModel[Dict[str, str]]):
     """
-    Runtime resource constraints as key-value pairs.
+    运行时资源约束，以键值对形式定义。
 
-    Similar to Kubernetes resource specifications, allows flexible definition
-    of resource limits. Common resource types include cpu, memory, and gpu.
+    类似于 Kubernetes 的资源规格定义，允许灵活地定义各种资源限制。
+    常见的资源类型包括：
+    - cpu: CPU 限制，支持毫核（如 "500m" 表示 0.5 核）或整数核（如 "2" 表示 2 核）
+    - memory: 内存限制，支持 Mi（如 "512Mi"）或 Gi（如 "2Gi"）
+    - gpu: GPU 数量（如 "1" 表示 1 个 GPU）
+
+    Examples:
+        ResourceLimits({"cpu": "500m", "memory": "512Mi"})
+        ResourceLimits({"cpu": "2", "memory": "4Gi", "gpu": "1"})
+
+    Attributes:
+        root: 资源键值对字典，如 {"cpu": "500m", "memory": "512Mi", "gpu": "1"}
     """
     root: Dict[str, str] = Field(
         default_factory=dict,
@@ -72,13 +120,31 @@ class ResourceLimits(RootModel[Dict[str, str]]):
 
 class NetworkRule(BaseModel):
     """
-    Egress rule: allow/deny a specific domain or wildcard.
+    出站网络规则：允许或拒绝特定的域名或通配符。
+
+    用于控制沙箱可以访问的外部网络资源。每条规则包含：
+    - action: allow（允许）或 deny（拒绝）
+    - target: 目标域名，支持通配符（如 "*.example.com"）
+
+    Examples:
+        # 允许访问特定域名
+        NetworkRule(action="allow", target="api.github.com")
+
+        # 拒绝访问特定域名
+        NetworkRule(action="deny", target="malicious-site.com")
+
+        # 允许访问所有子域名
+        NetworkRule(action="allow", target="*.googleapis.com")
+
+    Attributes:
+        action: 对匹配目标执行的操作（allow | deny）
+        target: 完全限定域名（FQDN）或通配符域名（如 'example.com'、'*.example.com'）
     """
 
-    action: str = Field(..., description="Whether to allow or deny matching targets (allow | deny).")
+    action: str = Field(..., description="对匹配目标执行的操作（allow | deny）")
     target: str = Field(
         ...,
-        description="FQDN or wildcard domain (e.g., 'example.com', '*.example.com').",
+        description="完全限定域名或通配符域名（如 'example.com'、'*.example.com'）",
         min_length=1,
     )
 
@@ -88,17 +154,36 @@ class NetworkRule(BaseModel):
 
 class NetworkPolicy(BaseModel):
     """
-    Egress network policy matching the sidecar /policy payload.
+    出站网络策略，匹配 sidecar /policy 端点的有效负载格式。
+
+    用于定义沙箱的出站网络访问控制策略。包含：
+    - default_action: 当没有规则匹配时的默认操作（allow 或 deny），默认为 deny
+    - egress: 有序的出站规则列表，空列表或未设置表示允许所有出站流量
+
+    Examples:
+        # 默认拒绝，只允许特定域名
+        NetworkPolicy(
+            default_action="deny",
+            egress=[
+                NetworkRule(action="allow", target="api.github.com"),
+                NetworkRule(action="allow", target="*.googleapis.com"),
+            ]
+        )
+
+    Attributes:
+        default_action: 当没有出站规则匹配时的默认操作（allow | deny），
+                        如果省略，sidecar 默认为 deny
+        egress: 有序的出站规则列表，空列表或未设置表示启动时允许所有
     """
 
     default_action: Optional[str] = Field(
         default=None,
         alias="defaultAction",
-        description="Default action when no egress rule matches (allow | deny). If omitted, sidecar defaults to deny.",
+        description="当没有出站规则匹配时的默认操作（allow | deny），如果省略，sidecar 默认为 deny",
     )
     egress: list[NetworkRule] = Field(
         default_factory=list,
-        description="Ordered egress rules. Empty/omitted yields allow-all at startup.",
+        description="有序的出站规则列表，空列表或未设置表示启动时允许所有",
     )
 
     class Config:
@@ -106,47 +191,62 @@ class NetworkPolicy(BaseModel):
 
 
 # ============================================================================
-# Volume Definitions
+# 卷配置（Volume Definitions）
 # ============================================================================
 
 
 class Host(BaseModel):
     """
-    Host path bind mount backend.
+    主机路径绑定挂载后端。
 
-    Maps a directory on the host filesystem into the container.
-    Only available when the runtime supports host mounts.
+    将主机文件系统上的目录挂载到容器中。
+    仅在运行时支持主机挂载时可用。
 
-    Security note: Host paths are restricted by server-side allowlist.
-    Users must specify paths under permitted prefixes.
+    安全说明：主机路径受服务器端允许列表限制。
+    用户必须指定在允许前缀下的路径。
+
+    Examples:
+        Host(path="/data/opensandbox/user1")
+
+    Attributes:
+        path: 主机文件系统上要挂载的绝对路径
     """
 
     path: str = Field(
         ...,
-        description="Absolute path on the host filesystem to mount.",
+        description="主机文件系统上要挂载的绝对路径",
         pattern=r"^(/|[A-Za-z]:[\\/])",
     )
 
 
 class PVC(BaseModel):
     """
-    Platform-managed named volume backend.
+    平台管理的命名卷后端。
 
-    A runtime-neutral abstraction for referencing a pre-existing, platform-managed
-    named volume. The semantics are identical across runtimes: claim an existing
-    volume by name, mount it into the container, and leave volume lifecycle
-    management to the user.
+    一种运行时中立的抽象，用于引用预先存在的、平台管理的命名卷。
+    在所有运行时中的语义相同：通过名称声明现有卷，将其挂载到容器中，
+    并将卷生命周期管理交给用户。
 
-    - Kubernetes: maps to a PersistentVolumeClaim in the same namespace.
-    - Docker: maps to a Docker named volume (created via ``docker volume create``).
+    - Kubernetes: 映射到同一命名空间中的 PersistentVolumeClaim
+    - Docker: 映射到 Docker 命名卷（通过 `docker volume create` 创建）
+
+    Examples:
+        # Kubernetes PVC
+        PVC(claim_name="my-data-pvc")
+
+        # Docker 命名卷
+        PVC(claim_name="my-docker-volume")
+
+    Attributes:
+        claim_name: 目标平台上的卷名称，在 Kubernetes 中是 PVC 名称，在 Docker 中是命名卷名称
     """
 
     claim_name: str = Field(
         ...,
         alias="claimName",
         description=(
-            "Name of the volume on the target platform. "
-            "In Kubernetes this is the PVC name; in Docker this is the named volume name."
+            "目标平台上的卷名称。"
+            "在 Kubernetes 中这是 PVC 名称；在 Docker 中这是命名卷名称。"
         ),
         pattern=r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?$",
         max_length=253,
@@ -158,47 +258,76 @@ class PVC(BaseModel):
 
 class OSSFS(BaseModel):
     """
-    Alibaba Cloud OSS mount backend via ossfs.
+    通过 ossfs 实现的阿里云 OSS 挂载后端。
 
-    The runtime mounts a host-side OSS path under ``storage.ossfs_mount_root``
-    and then bind-mounts the resolved path into the sandbox container. Prefix
-    selection is expressed via ``Volume.subPath``.
-    In Docker runtime, OSSFS backend requires the server host to be Linux with FUSE support.
+    运行时将主机端的 OSS 路径挂载到 `storage.ossfs_mount_root` 下，
+    然后将解析后的路径绑定挂载到沙箱容器中。
+    通过 `Volume.subPath` 选择前缀。
+
+    在 Docker 运行时中，OSSFS 后端需要运行在支持 FUSE 的 Linux 主机上。
+
+    Examples:
+        # 基本 OSS 挂载
+        OSSFS(
+            bucket="my-bucket",
+            endpoint="oss-cn-hangzhou.aliyuncs.com",
+            access_key_id="LTAI...",
+            access_key_secret="..."
+        )
+
+        # 带额外挂载选项
+        OSSFS(
+            bucket="my-bucket",
+            endpoint="oss-cn-hangzhou.aliyuncs.com",
+            access_key_id="LTAI...",
+            access_key_secret="...",
+            options=["allow_other", "max_stat_cache=10000"]
+        )
+
+    Attributes:
+        bucket: OSS 存储桶名称
+        endpoint: OSS 端点，如 'oss-cn-hangzhou.aliyuncs.com'
+        version: ossfs 主版本号，运行时挂载集成使用（"1.0" 或 "2.0"）
+        options: 额外的 ossfs 挂载选项，运行时根据版本编码选项：
+                 1.0 => 'ossfs ... -o <option>', 2.0 => 'ossfs2 config line --<option>'
+                 提供原始选项负载，不带前导 '-'
+        access_key_id: 内联凭证模式的 OSS 访问密钥 ID
+        access_key_secret: 内联凭证模式的 OSS 访问密钥密钥
     """
 
     bucket: str = Field(
         ...,
-        description="OSS bucket name.",
+        description="OSS 存储桶名称",
         min_length=3,
         max_length=63,
     )
     endpoint: str = Field(
         ...,
-        description="OSS endpoint, e.g. 'oss-cn-hangzhou.aliyuncs.com'.",
+        description="OSS 端点，如 'oss-cn-hangzhou.aliyuncs.com'",
         min_length=1,
     )
     version: Literal["1.0", "2.0"] = Field(
         "2.0",
-        description="ossfs major version used by runtime mount integration.",
+        description="ossfs 主版本号，运行时挂载集成使用",
     )
     options: Optional[List[str]] = Field(
         None,
         description=(
-            "Additional ossfs mount options. Runtime encodes options by version: "
-            "1.0 => 'ossfs ... -o <option>', 2.0 => 'ossfs2 config line --<option>'. "
-            "Provide raw option payloads without leading '-'."
+            "额外的 ossfs 挂载选项。运行时根据版本编码选项："
+            "1.0 => 'ossfs ... -o <option>', 2.0 => 'ossfs2 config line --<option>'。"
+            "提供原始选项负载，不带前导 '-'。"
         ),
     )
     access_key_id: Optional[str] = Field(
         None,
         alias="accessKeyId",
-        description="OSS access key ID for inline credentials mode.",
+        description="内联凭证模式的 OSS 访问密钥 ID",
         min_length=1,
     )
     access_key_secret: Optional[str] = Field(
         None,
         alias="accessKeySecret",
-        description="OSS access key secret for inline credentials mode.",
+        description="内联凭证模式的 OSS 访问密钥密钥",
         min_length=1,
     )
     class Config:
@@ -206,57 +335,108 @@ class OSSFS(BaseModel):
 
     @model_validator(mode="after")
     def validate_inline_credentials(self) -> "OSSFS":
-        """Ensure inline credentials are provided for current OSSFS mode."""
+        """
+        验证内联凭证是否正确提供。
+
+        对于当前 OSSFS 模式，必须同时提供 access_key_id 和 access_key_secret。
+
+        Returns:
+            self: 验证通过的 OSSFS 实例
+
+        Raises:
+            ValueError: 如果缺少任何一个凭证字段
+        """
         if not self.access_key_id or not self.access_key_secret:
             raise ValueError(
-                "OSSFS inline credentials are required: accessKeyId and accessKeySecret."
+                "OSSFS 内联凭证是必需的：需要提供 accessKeyId 和 accessKeySecret。"
             )
         return self
 
 
 class Volume(BaseModel):
     """
-    Storage mount definition for a sandbox.
+    沙箱的存储挂载定义。
 
-    Each volume entry contains:
-    - A unique name identifier
-    - Exactly one backend struct (host, pvc, etc.) with backend-specific fields
-    - Common mount settings (mountPath, readOnly, subPath)
+    每个卷条目包含：
+    - name: 唯一标识符，用于在沙箱内引用此卷
+    - 恰好一个后端结构（host、pvc、ossfs 等），包含特定于后端的字段
+    - mount_path: 容器内的挂载点绝对路径
+    - read_only: 是否只读挂载
+    - sub_path: 可选的后端路径下的子目录
+
+    Examples:
+        # 主机路径挂载
+        Volume(
+            name="data",
+            host=Host(path="/data/user1"),
+            mount_path="/app/data",
+            read_only=True
+        )
+
+        # PVC 挂载
+        Volume(
+            name="persistent-data",
+            pvc=PVC(claim_name="my-pvc"),
+            mount_path="/app/data",
+            sub_path="subdir"
+        )
+
+        # OSSFS 挂载
+        Volume(
+            name="oss-data",
+            ossfs=OSSFS(
+                bucket="my-bucket",
+                endpoint="oss-cn-hangzhou.aliyuncs.com",
+                access_key_id="...",
+                access_key_secret="..."
+            ),
+            mount_path="/app/oss",
+            sub_path="prefix/path"
+        )
+
+    Attributes:
+        name: 沙箱内卷的唯一标识符
+        host: 主机路径绑定挂载后端
+        pvc: 平台管理的命名卷后端（Kubernetes 中的 PVC 或 Docker 中的命名卷）
+        ossfs: OSSFS 挂载后端
+        mount_path: 容器内挂载卷的绝对路径
+        read_only: 如果为 true，卷以只读方式挂载，默认为 false（读写）
+        sub_path: 后端路径下要挂载的可选子目录
     """
 
     name: str = Field(
         ...,
-        description="Unique identifier for the volume within the sandbox.",
+        description="沙箱内卷的唯一标识符",
         pattern=r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?$",
         max_length=63,
     )
     host: Optional[Host] = Field(
         None,
-        description="Host path bind mount backend.",
+        description="主机路径绑定挂载后端",
     )
     pvc: Optional[PVC] = Field(
         None,
-        description="Platform-managed named volume backend (PVC in Kubernetes, named volume in Docker).",
+        description="平台管理的命名卷后端（Kubernetes 中的 PVC 或 Docker 中的命名卷）",
     )
     ossfs: Optional[OSSFS] = Field(
         None,
-        description="OSSFS mount backend.",
+        description="OSSFS 挂载后端",
     )
     mount_path: str = Field(
         ...,
         alias="mountPath",
-        description="Absolute path inside the container where the volume is mounted.",
+        description="容器内挂载卷的绝对路径",
         pattern=r"^/.*",
     )
     read_only: bool = Field(
         False,
         alias="readOnly",
-        description="If true, the volume is mounted as read-only. Defaults to false (read-write).",
+        description="如果为 true，卷以只读方式挂载，默认为 false（读写）",
     )
     sub_path: Optional[str] = Field(
         None,
         alias="subPath",
-        description="Optional subdirectory under the backend path to mount.",
+        description="后端路径下要挂载的可选子目录",
     )
 
     class Config:
@@ -264,40 +444,67 @@ class Volume(BaseModel):
 
     @model_validator(mode="after")
     def validate_exactly_one_backend(self) -> "Volume":
-        """Ensure exactly one backend type is specified."""
+        """
+        验证恰好指定了一个后端类型。
+
+        每个卷必须且只能指定一种后端类型（host、pvc 或 ossfs）。
+
+        Returns:
+            self: 验证通过的 Volume 实例
+
+        Raises:
+            ValueError: 如果没有指定后端或指定了多个后端
+        """
         backends = [self.host, self.pvc, self.ossfs]
         specified = [b for b in backends if b is not None]
         if len(specified) == 0:
-            raise ValueError("Exactly one backend (host, pvc, ossfs) must be specified, but none was provided.")
+            raise ValueError("必须指定恰好一个后端（host、pvc、ossfs），但未提供任何后端。")
         if len(specified) > 1:
-            raise ValueError("Exactly one backend (host, pvc, ossfs) must be specified, but multiple were provided.")
+            raise ValueError("必须指定恰好一个后端（host、pvc、ossfs），但提供了多个后端。")
         return self
 
 
 # ============================================================================
-# Sandbox Status
+# 沙箱状态（Sandbox Status）
 # ============================================================================
 
 class SandboxStatus(BaseModel):
     """
-    Detailed status information with lifecycle state and transition details.
+    详细的状态信息，包含生命周期状态和转换详情。
+
+    用于描述沙箱当前的生命周期状态，以及导致该状态的原因和相关信息。
+
+    生命周期状态包括：
+    - Pending: 沙箱正在创建中
+    - Running: 沙箱正在运行
+    - Pausing: 沙箱正在暂停中
+    - Paused: 沙箱已暂停
+    - Stopping: 沙箱正在停止中
+    - Terminated: 沙箱已终止
+    - Failed: 沙箱创建或运行失败
+
+    Attributes:
+        state: 当前生命周期状态（Pending、Running、Pausing、Paused、Stopping、Terminated、Failed）
+        reason: 当前状态的简短机器可读原因代码
+        message: 描述当前状态或状态转换原因的人类可读消息
+        last_transition_at: 最后一次状态转换的时间戳
     """
     state: str = Field(
         ...,
-        description="Current lifecycle state (Pending, Running, Pausing, Paused, Stopping, Terminated, Failed)",
+        description="当前生命周期状态（Pending、Running、Pausing、Paused、Stopping、Terminated、Failed）",
     )
     reason: Optional[str] = Field(
         None,
-        description="Short machine-readable reason code for the current state",
+        description="当前状态的简短机器可读原因代码",
     )
     message: Optional[str] = Field(
         None,
-        description="Human-readable message describing the current state or reason for state transition",
+        description="描述当前状态或状态转换原因的人类可读消息",
     )
     last_transition_at: Optional[datetime] = Field(
         None,
         alias="lastTransitionAt",
-        description="Timestamp of the last state transition",
+        description="最后一次状态转换的时间戳",
     )
 
     class Config:
@@ -305,62 +512,89 @@ class SandboxStatus(BaseModel):
 
 
 # ============================================================================
-# Sandbox Models
+# 沙箱模型（Sandbox Models）
 # ============================================================================
 
 class CreateSandboxRequest(BaseModel):
     """
-    Request to create a new sandbox from a container image.
+    从容器镜像创建新沙箱的请求。
+
+    包含创建沙箱所需的所有参数，包括镜像、资源限制、环境变量等。
+
+    Examples:
+        CreateSandboxRequest(
+            image=ImageSpec(uri="python:3.11"),
+            resource_limits=ResourceLimits({"cpu": "500m", "memory": "512Mi"}),
+            entrypoint=["python", "/app/main.py"],
+            timeout=3600,
+            env={"PYTHONUNBUFFERED": "1"},
+            metadata={"user": "alice", "project": "demo"}
+        )
+
+    Attributes:
+        image: 沙箱的容器镜像规格
+        timeout: 沙箱超时时间（秒），最小值 60。
+                 最大值由服务器的 max_sandbox_timeout_seconds 控制。
+                 如果省略或为 null，沙箱不会自动终止，需要显式删除。
+                 注意：手动清理支持取决于运行时；Kubernetes 提供者在运行时不支持非过期沙箱时可能会拒绝 null timeout。
+        resource_limits: 沙箱实例的运行时资源约束
+        env: 注入到沙箱运行时的环境变量
+        metadata: 用于管理、过滤和标签的自定义键值对元数据
+        entrypoint: 作为沙箱入口进程执行的命令
+        network_policy: 可选的出站网络策略，形状匹配 egress sidecar 的 /policy 端点，
+                        空/省略表示允许所有，直到更新
+        volumes: 沙箱的存储挂载，每个卷条目指定一个命名的后端特定存储源和通用挂载设置，
+                 每个卷条目必须恰好指定一种后端类型
+        extensions: 提供者的不透明容器，用于提供核心 API 未涵盖的特定于提供者或瞬态参数
     """
-    image: ImageSpec = Field(..., description="Container image specification for the sandbox")
+    image: ImageSpec = Field(..., description="沙箱的容器镜像规格")
     timeout: Optional[int] = Field(
         None,
         ge=60,
         description=(
-            "Sandbox timeout in seconds (minimum 60). "
-            "The maximum is controlled by server.max_sandbox_timeout_seconds. "
-            "When omitted or null, the sandbox will not auto-terminate and must be deleted explicitly. "
-            "Note: manual cleanup support is runtime-dependent; Kubernetes providers may reject "
-            "null timeout when the workload provider does not support non-expiring sandboxes."
+            "沙箱超时时间（秒），最小值 60。"
+            "最大值由服务器的 max_sandbox_timeout_seconds 控制。"
+            "如果省略或为 null，沙箱不会自动终止，需要显式删除。"
+            "注意：手动清理支持取决于运行时；Kubernetes 提供者在运行时不支持非过期沙箱时可能会拒绝 null timeout。"
         ),
     )
     resource_limits: ResourceLimits = Field(
         ...,
         alias="resourceLimits",
-        description="Runtime resource constraints for the sandbox instance",
+        description="沙箱实例的运行时资源约束",
     )
     env: Optional[Dict[str, Optional[str]]] = Field(
         None,
-        description="Environment variables to inject into the sandbox runtime",
+        description="注入到沙箱运行时的环境变量",
     )
     metadata: Optional[Dict[str, str]] = Field(
         None,
-        description="Custom key-value metadata for management, filtering, and tagging",
+        description="用于管理、过滤和标签的自定义键值对元数据",
     )
     entrypoint: List[str] = Field(
         ...,
         min_length=1,
-        description="The command to execute as the sandbox's entry process",
+        description="作为沙箱入口进程执行的命令",
         example=["python", "/app/main.py"],
     )
     network_policy: Optional[NetworkPolicy] = Field(
         None,
         alias="networkPolicy",
         description=(
-            "Optional outbound network policy. Shape matches the egress sidecar /policy endpoint. "
-            "Empty/omitted means allow-all until updated."
+            "可选的出站网络策略。形状匹配 egress sidecar 的 /policy 端点。"
+            "空/省略表示启动时允许所有。"
         ),
     )
     volumes: Optional[List[Volume]] = Field(
         None,
         description=(
-            "Storage mounts for the sandbox. Each volume entry specifies a named backend-specific "
-            "storage source and common mount settings. Exactly one backend type must be specified per volume entry."
+            "沙箱的存储挂载。每个卷条目指定一个命名的后端特定存储源和通用挂载设置。"
+            "每个卷条目必须恰好指定一种后端类型。"
         ),
     )
     extensions: Optional[Dict[str, str]] = Field(
         None,
-        description="Opaque container for provider-specific or transient parameters not covered by the core API",
+        description="提供者的不透明容器，用于提供核心 API 未涵盖的特定于提供者或瞬态参数",
     )
 
     class Config:
@@ -369,20 +603,28 @@ class CreateSandboxRequest(BaseModel):
 
 class CreateSandboxResponse(BaseModel):
     """
-    Response from creating a new sandbox.
+    创建新沙箱的响应。
 
-    Contains essential information without image and updatedAt.
+    包含沙箱的基本信息，但不包括镜像和 updatedAt 字段。
+
+    Attributes:
+        id: 沙箱唯一标识符
+        status: 当前生命周期状态和详细状态信息
+        metadata: 创建请求中的自定义元数据
+        expires_at: 沙箱自动终止的时间戳，手动清理启用时为 null
+        created_at: 沙箱创建时间戳
+        entrypoint: 创建请求中的入口进程规格
     """
-    id: str = Field(..., description="Unique sandbox identifier")
-    status: SandboxStatus = Field(..., description="Current lifecycle status and detailed state information")
-    metadata: Optional[Dict[str, str]] = Field(None, description="Custom metadata from creation request")
+    id: str = Field(..., description="沙箱唯一标识符")
+    status: SandboxStatus = Field(..., description="当前生命周期状态和详细状态信息")
+    metadata: Optional[Dict[str, str]] = Field(None, description="创建请求中的自定义元数据")
     expires_at: Optional[datetime] = Field(
         None,
         alias="expiresAt",
-        description="Timestamp when sandbox will auto-terminate. Null when manual cleanup is enabled.",
+        description="沙箱自动终止的时间戳，手动清理启用时为 null",
     )
-    created_at: datetime = Field(..., alias="createdAt", description="Sandbox creation timestamp")
-    entrypoint: List[str] = Field(..., description="Entry process specification from creation request")
+    created_at: datetime = Field(..., alias="createdAt", description="沙箱创建时间戳")
+    entrypoint: List[str] = Field(..., description="创建请求中的入口进程规格")
 
     class Config:
         populate_by_name = True
@@ -390,56 +632,90 @@ class CreateSandboxResponse(BaseModel):
 
 class Sandbox(BaseModel):
     """
-    Runtime execution environment provisioned from a container image.
+    从容器镜像配置的运行时执行环境。
 
-    This is the complete representation of the sandbox resource.
+    这是沙箱资源的完整表示，包含所有相关信息。
+
+    Attributes:
+        id: 沙箱唯一标识符
+        image: 用于配置此沙箱的容器镜像规格
+        status: 当前生命周期状态和详细状态信息
+        metadata: 创建请求中的自定义元数据
+        entrypoint: 作为沙箱入口进程执行的命令
+        expires_at: 沙箱自动终止的时间戳，手动清理启用时为 null
+        created_at: 沙箱创建时间戳
     """
-    id: str = Field(..., description="Unique sandbox identifier")
-    image: ImageSpec = Field(..., description="Container image specification used to provision this sandbox")
-    status: SandboxStatus = Field(..., description="Current lifecycle status and detailed state information")
-    metadata: Optional[Dict[str, str]] = Field(None, description="Custom metadata from creation request")
-    entrypoint: List[str] = Field(..., description="The command to execute as the sandbox's entry process")
+    id: str = Field(..., description="沙箱唯一标识符")
+    image: ImageSpec = Field(..., description="用于配置此沙箱的容器镜像规格")
+    status: SandboxStatus = Field(..., description="当前生命周期状态和详细状态信息")
+    metadata: Optional[Dict[str, str]] = Field(None, description="创建请求中的自定义元数据")
+    entrypoint: List[str] = Field(..., description="作为沙箱入口进程执行的命令")
     expires_at: Optional[datetime] = Field(
         None,
         alias="expiresAt",
-        description="Timestamp when sandbox will auto-terminate. Null when manual cleanup is enabled.",
+        description="沙箱自动终止的时间戳，手动清理启用时为 null",
     )
-    created_at: datetime = Field(..., alias="createdAt", description="Sandbox creation timestamp")
+    created_at: datetime = Field(..., alias="createdAt", description="沙箱创建时间戳")
 
     class Config:
         populate_by_name = True
 
 
 # ============================================================================
-# List Sandboxes
+# 列表沙箱（List Sandboxes）
 # ============================================================================
 
 class SandboxFilter(BaseModel):
     """
-    Filtering criteria for listing sandboxes.
+    列出沙箱时的过滤条件。
+
+    用于根据状态或元数据过滤沙箱列表。
+
+    Examples:
+        # 按状态过滤
+        SandboxFilter(state=["Running", "Paused"])
+
+        # 按元数据过滤
+        SandboxFilter(metadata={"user": "alice", "project": "demo"})
+
+        # 组合过滤
+        SandboxFilter(
+            state=["Running"],
+            metadata={"user": "alice"}
+        )
+
+    Attributes:
+        state: 按生命周期状态过滤（status.state）- 支持 OR 逻辑，
+               如 ["Running", "Paused"] 会匹配状态为 Running 或 Paused 的沙箱
+        metadata: 按元数据键值对过滤（AND 逻辑），
+                  如 {"user": "alice", "project": "demo"} 会匹配同时具有这两个元数据的沙箱
     """
     state: Optional[List[str]] = Field(
         None,
         min_length=1,
-        description="Filter by lifecycle state (status.state) - supports OR logic",
+        description="按生命周期状态过滤（status.state）- 支持 OR 逻辑",
     )
     metadata: Optional[Dict[str, str]] = Field(
         None,
-        description="Filter by metadata key-value pairs (AND logic)",
+        description="按元数据键值对过滤（AND 逻辑）",
     )
 
 
 class PaginationRequest(BaseModel):
     """
-    Pagination parameters for list requests.
+    列表请求的分页参数。
+
+    Attributes:
+        page: 页码，从 1 开始
+        page_size: 每页的项目数，范围 1-200，默认 20
     """
-    page: int = Field(1, ge=1, description="Page number")
+    page: int = Field(1, ge=1, description="页码")
     page_size: int = Field(
         20,
         ge=1,
         le=200,
         alias="pageSize",
-        description="Number of items per page",
+        description="每页的项目数",
     )
 
     class Config:
@@ -448,24 +724,47 @@ class PaginationRequest(BaseModel):
 
 class ListSandboxesRequest(BaseModel):
     """
-    Request body for complex listing queries.
+    复杂列表查询的请求体。
+
+    包含过滤条件和分页参数。
+
+    Examples:
+        # 基本列表（无过滤，无分页）
+        ListSandboxesRequest()
+
+        # 带过滤和分页
+        ListSandboxesRequest(
+            filter=SandboxFilter(state=["Running"], metadata={"user": "alice"}),
+            pagination=PaginationRequest(page=1, page_size=10)
+        )
+
+    Attributes:
+        filter: 过滤条件（所有条件使用 AND 逻辑组合）
+        pagination: 分页参数，可选
     """
     filter: SandboxFilter = Field(
         default_factory=SandboxFilter,
-        description="Filtering criteria (all conditions combined with AND logic)",
+        description="过滤条件（所有条件使用 AND 逻辑组合）",
     )
-    pagination: Optional[PaginationRequest] = Field(None, description="Pagination parameters")
+    pagination: Optional[PaginationRequest] = Field(None, description="分页参数")
 
 
 class PaginationInfo(BaseModel):
     """
-    Pagination metadata for list responses.
+    列表响应的分页元数据。
+
+    Attributes:
+        page: 当前页码
+        page_size: 每页的项目数
+        total_items: 匹配的总项目数
+        total_pages: 总页数
+        has_next_page: 当前页之后是否还有更多页
     """
-    page: int = Field(..., ge=1, description="Current page number")
-    page_size: int = Field(..., ge=1, alias="pageSize", description="Number of items per page")
-    total_items: int = Field(..., ge=0, alias="totalItems", description="Total number of items matching the filter")
-    total_pages: int = Field(..., ge=0, alias="totalPages", description="Total number of pages")
-    has_next_page: bool = Field(..., alias="hasNextPage", description="Whether there are more pages after the current one")
+    page: int = Field(..., ge=1, description="当前页码")
+    page_size: int = Field(..., ge=1, alias="pageSize", description="每页的项目数")
+    total_items: int = Field(..., ge=0, alias="totalItems", description="匹配的总项目数")
+    total_pages: int = Field(..., ge=0, alias="totalPages", description="总页数")
+    has_next_page: bool = Field(..., alias="hasNextPage", description="当前页之后是否还有更多页")
 
     class Config:
         populate_by_name = True
@@ -473,24 +772,38 @@ class PaginationInfo(BaseModel):
 
 class ListSandboxesResponse(BaseModel):
     """
-    Paginated collection of sandboxes.
+    沙箱的分页集合响应。
+
+    Attributes:
+        items: 沙箱列表
+        pagination: 分页元数据
     """
-    items: List[Sandbox] = Field(..., description="List of sandboxes")
-    pagination: PaginationInfo = Field(..., description="Pagination metadata")
+    items: List[Sandbox] = Field(..., description="沙箱列表")
+    pagination: PaginationInfo = Field(..., description="分页元数据")
 
 
 # ============================================================================
-# Renew Expiration
+# 续期过期时间（Renew Expiration）
 # ============================================================================
 
 class RenewSandboxExpirationRequest(BaseModel):
     """
-    Request to renew sandbox expiration time.
+    续期沙箱过期时间的请求。
+
+    用于延长沙箱的生命周期，设置新的绝对过期时间。
+
+    Examples:
+        RenewSandboxExpirationRequest(
+            expires_at=datetime.fromisoformat("2025-12-31T23:59:59Z")
+        )
+
+    Attributes:
+        expires_at: 新的绝对过期时间，UTC 格式（RFC 3339），必须是未来的时间
     """
     expires_at: datetime = Field(
         ...,
         alias="expiresAt",
-        description="New absolute expiration time in UTC (RFC 3339 format). Must be in the future.",
+        description="新的绝对过期时间，UTC 格式（RFC 3339），必须是未来的时间",
     )
 
     class Config:
@@ -499,12 +812,15 @@ class RenewSandboxExpirationRequest(BaseModel):
 
 class RenewSandboxExpirationResponse(BaseModel):
     """
-    Response for renewing sandbox expiration.
+    续期沙箱过期时间的响应。
+
+    Attributes:
+        expires_at: 新的绝对过期时间，UTC 格式（RFC 3339）
     """
     expires_at: datetime = Field(
         ...,
         alias="expiresAt",
-        description="The new absolute expiration time in UTC (RFC 3339 format)",
+        description="新的绝对过期时间，UTC 格式（RFC 3339）",
     )
 
     class Config:
@@ -512,38 +828,77 @@ class RenewSandboxExpirationResponse(BaseModel):
 
 
 # ============================================================================
-# Endpoint
+# 端点（Endpoint）
 # ============================================================================
 
 class Endpoint(BaseModel):
     """
-    Endpoint for accessing a service running in the sandbox.
+    用于访问沙箱内运行服务的端点。
+
+    提供访问沙箱内服务的公共端点 URL。
+
+    Examples:
+        # 基本端点
+        Endpoint(endpoint="192.168.1.100:8080")
+
+        # 带请求头的端点（用于基于请求头的路由）
+        Endpoint(
+            endpoint="192.168.1.100:8080",
+            headers={"X-Route-Id": "sandbox-123"}
+        )
+
+    Attributes:
+        endpoint: 为沙箱服务暴露的公共端点字符串（host[:port]/path）
+        headers: 访问端点时需要的可选请求头（如用于基于请求头的路由）
     """
     endpoint: str = Field(
         ...,
-        description="Public endpoint string (host[:port]/path) exposed for the sandbox service",
+        description="为沙箱服务暴露的公共端点字符串（host[:port]/path）",
     )
     headers: Optional[dict[str, str]] = Field(
         default=None,
-        description="Optional headers required when accessing the endpoint (e.g., for header-based routing).",
+        description="访问端点时需要的可选请求头（如用于基于请求头的路由）",
     )
 
 
 # ============================================================================
-# Error Response
+# 错误响应（Error Response）
 # ============================================================================
 
 class ErrorResponse(BaseModel):
     """
-    Standard error response for all non-2xx HTTP responses.
+    所有非 2xx HTTP 响应的标准错误响应格式。
 
-    HTTP status code indicates the error category; code and message provide details.
+    HTTP 状态码表示错误类别；code 和 message 提供详细信息。
+
+    Examples:
+        # 资源未找到
+        ErrorResponse(
+            code="NOT_FOUND",
+            message="Sandbox '123' not found"
+        )
+
+        # 无效请求
+        ErrorResponse(
+            code="INVALID_REQUEST",
+            message="Missing required field 'image'"
+        )
+
+        # 内部服务器错误
+        ErrorResponse(
+            code="INTERNAL_ERROR",
+            message="Failed to connect to Docker daemon"
+        )
+
+    Attributes:
+        code: 机器可读的错误代码（如 INVALID_REQUEST、NOT_FOUND、INTERNAL_ERROR）
+        message: 人类可读的错误消息，描述问题及如何修复
     """
     code: str = Field(
         ...,
-        description="Machine-readable error code (e.g., INVALID_REQUEST, NOT_FOUND, INTERNAL_ERROR)",
+        description="机器可读的错误代码（如 INVALID_REQUEST、NOT_FOUND、INTERNAL_ERROR）",
     )
     message: str = Field(
         ...,
-        description="Human-readable error message describing what went wrong and how to fix it",
+        description="人类可读的错误消息，描述问题及如何修复",
     )

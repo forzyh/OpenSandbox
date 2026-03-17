@@ -13,10 +13,32 @@
 # limitations under the License.
 
 """
-Kubernetes-based implementation of SandboxService.
+基于 Kubernetes 的 Sandbox 服务实现模块。
 
-This module provides a Kubernetes implementation of the sandbox service interface,
-using Kubernetes resources for sandbox lifecycle management.
+本模块提供了 KubernetesSandboxService 类，是 SandboxService 接口在
+Kubernetes 运行时下的具体实现。它使用 Kubernetes 资源（如 Pod 或 CRD）
+来管理 sandbox 的生命周期。
+
+主要功能：
+- 创建 sandbox（使用 Kubernetes 工作负载提供者）
+- 获取/删除/列出 sandbox
+- 更新过期时间
+- 获取 sandbox 端点信息
+- 等待 sandbox 就绪
+- 支持网络策略（egress 侧车）
+- 支持镜像拉取认证
+- 支持卷挂载
+
+架构说明：
+    KubernetesSandboxService 通过 WorkloadProvider 抽象与底层
+    Kubernetes 资源交互。当前支持的提供者：
+    - BatchSandboxProvider：使用 BatchSandbox CRD
+    - AgentSandboxProvider：使用 Agent-sandbox CRD
+
+使用示例：
+    >>> service = KubernetesSandboxService(app_config)
+    >>> response = service.create_sandbox(request)
+    >>> sandbox = service.get_sandbox(response.id)
 """
 
 import logging
@@ -63,51 +85,73 @@ logger = logging.getLogger(__name__)
 
 class KubernetesSandboxService(SandboxService):
     """
-    Kubernetes-based implementation of SandboxService.
-    
-    This class implements sandbox lifecycle operations using Kubernetes resources.
+    基于 Kubernetes 的 SandboxService 实现。
+
+    该类使用 Kubernetes 资源实现 sandbox 生命周期管理。
+
+    特性：
+    - 使用 WorkloadProvider 抽象支持不同的 Kubernetes 资源类型
+    - 支持模板模式和池模式（取决于提供者）
+    - 支持安全运行时（RuntimeClass）
+    - 支持网络策略（egress 侧车）
+    - 支持镜像拉取认证
+    - 支持卷挂载（PVC、hostPath）
+    - 自动等待 sandbox 就绪
+
+    Attributes:
+        app_config: 应用配置
+        ingress_config: Ingress 配置
+        namespace: Kubernetes 命名空间
+        execd_image: execd 守护进程镜像
+        k8s_client: Kubernetes 客户端
+        workload_provider: 工作负载提供者
+
+    Examples:
+        >>> service = KubernetesSandboxService(app_config)
+        >>> response = service.create_sandbox(request)
     """
-    
+
     def __init__(self, config: Optional[AppConfig] = None):
         """
-        Initialize Kubernetes sandbox service.
-        
+        初始化 Kubernetes sandbox 服务。
+
         Args:
-            config: Application configuration
-            
+            config: 应用配置
+
         Raises:
-            HTTPException: If initialization fails
+            HTTPException: 如果初始化失败
+            ValueError: 如果配置不兼容
         """
         self.app_config = config or get_config()
         runtime_config = self.app_config.runtime
-        
+
         if runtime_config.type != "kubernetes":
-            raise ValueError("KubernetesSandboxService requires runtime.type = 'kubernetes'")
-        
+            raise ValueError("KubernetesSandboxService 需要 runtime.type = 'kubernetes'")
+
         if not self.app_config.kubernetes:
-            raise ValueError("Kubernetes configuration is required")
-        
-        # Ingress configuration (direct/gateway) if provided
+            raise ValueError("Kubernetes 配置是必需的")
+
+        # Ingress 配置（直接/gateway）
         self.ingress_config = self.app_config.ingress
 
         self.namespace = self.app_config.kubernetes.namespace
         self.execd_image = runtime_config.execd_image
-        
-        # Initialize Kubernetes client
+
+        # 初始化 Kubernetes 客户端
         try:
             self.k8s_client = K8sClient(self.app_config.kubernetes)
-            logger.info("Kubernetes client initialized successfully")
+            logger.info("Kubernetes 客户端初始化成功")
         except Exception as e:
-            logger.error(f"Failed to initialize Kubernetes client: {e}")
+            logger.error(f"初始化 Kubernetes 客户端失败：{e}")
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail={
                     "code": SandboxErrorCodes.K8S_INITIALIZATION_ERROR,
-                    "message": f"Failed to initialize Kubernetes client: {str(e)}",
+                    "message": f"初始化 Kubernetes 客户端失败：{str(e)}",
                 },
             ) from e
-        
-        # Initialize workload provider
+
+        # 初始化工作负载提供者
         provider_type = self.app_config.kubernetes.workload_provider
         try:
             self.workload_provider = create_workload_provider(
@@ -116,24 +160,24 @@ class KubernetesSandboxService(SandboxService):
                 app_config=self.app_config,
             )
             logger.info(
-                f"Initialized workload provider: {self.workload_provider.__class__.__name__}"
+                f"初始化工作负载提供者：{self.workload_provider.__class__.__name__}"
             )
         except ValueError as e:
-            logger.error(f"Failed to create workload provider: {e}")
+            logger.error(f"创建工作负载提供者失败：{e}")
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail={
                     "code": SandboxErrorCodes.K8S_INITIALIZATION_ERROR,
-                    "message": f"Invalid workload provider configuration: {str(e)}",
+                    "message": f"工作负载提供者配置无效：{str(e)}",
                 },
             ) from e
-        
+
         logger.info(
-            "KubernetesSandboxService initialized: namespace=%s, execd_image=%s",
+            "KubernetesSandboxService 初始化完成：namespace=%s, execd_image=%s",
             self.namespace,
             self.execd_image,
         )
-    
+
     def _wait_for_sandbox_ready(
         self,
         sandbox_id: str,
@@ -141,95 +185,102 @@ class KubernetesSandboxService(SandboxService):
         poll_interval_seconds: float = 1.0,
     ) -> Dict[str, Any]:
         """
-        Wait for Pod to be Running and have an IP address.
-        
+        等待 Pod 进入 Running 状态并具有 IP 地址。
+
+        该方法轮询 sandbox 状态，直到：
+        - Pod 状态为 Running 或 Allocated（已分配 IP）
+        - 超时
+
         Args:
-            sandbox_id: Sandbox ID
-            timeout_seconds: Maximum time to wait in seconds
-            poll_interval_seconds: Time between polling attempts
-            
+            sandbox_id: Sandbox 唯一标识符
+            timeout_seconds: 最大等待时间（秒）
+            poll_interval_seconds: 轮询间隔（秒）
+
         Returns:
-            Workload dict when Pod is Running with IP
-            
+            Dict[str, Any]: 当 Pod 处于 Running 状态且有 IP 时返回工作负载字典
+
         Raises:
-            HTTPException: If timeout or Pod fails
+            HTTPException: 如果超时或 Pod 状态失败
+
+        状态流转：
+            Pending -> Allocated (已分配 IP) -> Running (Pod 就绪)
         """
         logger.info(
-            f"Waiting for sandbox {sandbox_id} to be Running with IP (timeout: {timeout_seconds}s)"
+            f"等待 sandbox {sandbox_id} 进入 Running 状态且有 IP（超时：{timeout_seconds}秒）"
         )
-        
+
         start_time = time.time()
         last_state = None
         last_message = None
-        
+
         while time.time() - start_time < timeout_seconds:
             try:
-                # Get current workload status
+                # 获取当前工作负载状态
                 workload = self.workload_provider.get_workload(
                     sandbox_id=sandbox_id,
                     namespace=self.namespace,
                 )
-                
+
                 if not workload:
-                    logger.debug(f"Workload not found yet for sandbox {sandbox_id}")
+                    logger.debug(f"sandbox {sandbox_id} 的工作负载还未找到")
                     time.sleep(poll_interval_seconds)
                     continue
-                
-                # Get status
+
+                # 获取状态
                 status_info = self.workload_provider.get_status(workload)
                 current_state = status_info["state"]
                 current_message = status_info["message"]
-                
-                # Log state changes
+
+                # 记录状态变化
                 if current_state != last_state or current_message != last_message:
                     logger.info(
-                        f"Sandbox {sandbox_id} state: {current_state} - {current_message}"
+                        f"Sandbox {sandbox_id} 状态：{current_state} - {current_message}"
                     )
                     last_state = current_state
                     last_message = current_message
-                
-                # Check if Running or Allocated (IP assigned)
+
+                # 检查是否 Running 或 Allocated（已分配 IP）
                 if current_state in ("Running", "Allocated"):
                     return workload
-                
+
             except HTTPException:
                 raise
             except Exception as e:
                 logger.warning(
-                    f"Error checking sandbox {sandbox_id} status: {e}",
+                    f"检查 sandbox {sandbox_id} 状态时出错：{e}",
                     exc_info=True
                 )
-            
-            # Wait before next poll
+
+            # 等待下次轮询
             time.sleep(poll_interval_seconds)
-        
-        # Timeout
+
+        # 超时
         elapsed = time.time() - start_time
         raise HTTPException(
             status_code=status.HTTP_504_GATEWAY_TIMEOUT,
             detail={
                 "code": SandboxErrorCodes.K8S_POD_READY_TIMEOUT,
                 "message": (
-                    f"Timeout waiting for sandbox {sandbox_id} to be Running with IP. "
-                    f"Elapsed: {elapsed:.1f}s, Last state: {last_state}"
+                    f"等待 sandbox {sandbox_id} 进入 Running 状态且有 IP 超时。"
+                    f"已用时间：{elapsed:.1f}秒，最后状态：{last_state}"
                 ),
             },
         )
-    
+
     def _ensure_network_policy_support(self, request: CreateSandboxRequest) -> None:
         """
-        Validate that network policy can be honored under the current runtime config.
-        
-        This validates that egress.image is configured when network_policy is provided.
+        验证在当前运行时配置下可以满足网络策略要求。
+
+        这验证了在提供 network_policy 时是否配置了 egress.image。
         """
-        # Common validation: egress.image must be configured
+        # 通用验证：必须配置 egress.image
         ensure_egress_configured(request.network_policy, self.app_config.egress)
 
     def _ensure_image_auth_support(self, request: CreateSandboxRequest) -> None:
         """
-        Validate image auth support for the current workload provider.
+        验证当前工作负载提供者是否支持镜像认证。
 
-        Raises HTTP 400 if the provider does not support per-request image auth.
+        如果提供者不支持按请求的镜像认证，抛出 HTTP 400 错误。
         """
         if request.image.auth is None:
             return
@@ -240,28 +291,28 @@ class KubernetesSandboxService(SandboxService):
             detail={
                 "code": SandboxErrorCodes.INVALID_PARAMETER,
                 "message": (
-                    "image.auth is not supported by the current workload provider. "
-                    "Use imagePullSecrets via Kubernetes ServiceAccount or sandbox template."
+                    "当前工作负载提供者不支持 image.auth。"
+                    "请通过 Kubernetes ServiceAccount 或 sandbox 模板使用 imagePullSecrets。"
                 ),
             },
         )
 
     def create_sandbox(self, request: CreateSandboxRequest) -> CreateSandboxResponse:
         """
-        Create a new sandbox using Kubernetes Pod.
-        
-        Wait for the Pod to be Running and have an IP address before returning.
-        
+        使用 Kubernetes Pod 创建新的 sandbox。
+
+        在返回之前等待 Pod 进入 Running 状态并具有 IP 地址。
+
         Args:
-            request: Sandbox creation request.
-            
+            request: Sandbox 创建请求
+
         Returns:
-            CreateSandboxResponse: Created sandbox information with Running state
-            
+            CreateSandboxResponse: 创建的 sandbox 信息，状态为 Running
+
         Raises:
-            HTTPException: If creation fails, timeout, or invalid parameters
+            HTTPException: 如果创建失败、超时或参数无效
         """
-        # Validate request
+        # 验证请求
         ensure_entrypoint(request.entrypoint)
         ensure_metadata_labels(request.metadata)
         ensure_timeout_within_limit(
@@ -270,11 +321,11 @@ class KubernetesSandboxService(SandboxService):
         )
         self._ensure_network_policy_support(request)
         self._ensure_image_auth_support(request)
-        
-        # Generate sandbox ID
+
+        # 生成 sandbox ID
         sandbox_id = self.generate_sandbox_id()
-        
-        # Calculate expiration time
+
+        # 计算过期时间
         created_at = datetime.now(timezone.utc)
         expires_at = None
         if request.timeout is not None:
@@ -285,38 +336,38 @@ class KubernetesSandboxService(SandboxService):
                 detail={
                     "code": SandboxErrorCodes.INVALID_PARAMETER,
                     "message": (
-                        "Manual cleanup mode is not supported by the current Kubernetes workload provider."
+                        "当前 Kubernetes 工作负载提供者不支持手动清理模式。"
                     ),
                 },
             )
-        
-        # Build labels
+
+        # 构建标签
         labels = {
             SANDBOX_ID_LABEL: sandbox_id,
         }
-        
-        # Add user metadata as labels
+
+        # 添加用户元数据作为标签
         if request.metadata:
             labels.update(request.metadata)
-        
-        # Extract resource limits
+
+        # 提取资源限制
         resource_limits = {}
         if request.resource_limits and request.resource_limits.root:
             resource_limits = request.resource_limits.root
-        
+
         try:
-            # Get egress image if network policy is provided
+            # 如果提供了网络策略，获取 egress 镜像
             egress_image = None
             if request.network_policy:
                 egress_image = self.app_config.egress.image if self.app_config.egress else None
-            
-            # Validate volumes before creating workload
+
+            # 在创建工作负载之前验证卷
             ensure_volumes_valid(
                 request.volumes,
                 self.app_config.storage.allowed_host_paths or None,
             )
-            
-            # Create workload
+
+            # 创建工作负载
             workload_info = self.workload_provider.create_workload(
                 sandbox_id=sandbox_id,
                 namespace=self.namespace,
@@ -332,25 +383,25 @@ class KubernetesSandboxService(SandboxService):
                 egress_image=egress_image,
                 volumes=request.volumes,
             )
-            
+
             logger.info(
-                "Created sandbox: id=%s, workload=%s",
+                "创建了 sandbox：id=%s, workload=%s",
                 sandbox_id,
                 workload_info.get("name"),
             )
-            
-            # Wait for Pod to be Running with IP
+
+            # 等待 Pod 进入 Running 状态且有 IP
             try:
                 workload = self._wait_for_sandbox_ready(
                     sandbox_id=sandbox_id,
                     timeout_seconds=self.app_config.kubernetes.sandbox_create_timeout_seconds,
                     poll_interval_seconds=self.app_config.kubernetes.sandbox_create_poll_interval_seconds,
                 )
-                
-                # Get final status
+
+                # 获取最终状态
                 status_info = self.workload_provider.get_status(workload)
-                
-                # Build and return response with Running state
+
+                # 构建并返回 Running 状态的响应
                 return CreateSandboxResponse(
                     id=sandbox_id,
                     status=SandboxStatus(
@@ -365,21 +416,21 @@ class KubernetesSandboxService(SandboxService):
                     image=request.image,
                     entrypoint=request.entrypoint,
                 )
-                
+
             except HTTPException:
-                # Clean up on failure
+                # 失败时清理
                 try:
-                    logger.warning(f"Creation failed, cleaning up sandbox: {sandbox_id}")
+                    logger.warning(f"创建失败，清理 sandbox：{sandbox_id}")
                     self.workload_provider.delete_workload(sandbox_id, self.namespace)
                 except Exception as cleanup_ex:
-                    logger.error(f"Failed to cleanup sandbox {sandbox_id}", exc_info=cleanup_ex)
+                    logger.error(f"清理 sandbox {sandbox_id} 失败", exc_info=cleanup_ex)
                 raise
-            
+
         except HTTPException:
             raise
         except ValueError as e:
-            # Handle parameter validation errors from provider
-            logger.error(f"Invalid parameters for sandbox creation: {e}")
+            # 处理来自提供者的参数验证错误
+            logger.error(f"sandbox 创建参数无效：{e}")
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail={
@@ -388,100 +439,100 @@ class KubernetesSandboxService(SandboxService):
                 },
             ) from e
         except Exception as e:
-            logger.error(f"Error creating sandbox: {e}")
+            logger.error(f"创建 sandbox 时出错：{e}")
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail={
                     "code": SandboxErrorCodes.K8S_API_ERROR,
-                    "message": f"Failed to create sandbox: {str(e)}",
+                    "message": f"创建 sandbox 失败：{str(e)}",
                 },
             ) from e
-    
+
     def get_sandbox(self, sandbox_id: str) -> Sandbox:
         """
-        Get sandbox by ID.
-        
+        按 ID 获取 sandbox。
+
         Args:
-            sandbox_id: Unique sandbox identifier
-            
+            sandbox_id: Sandbox 唯一标识符
+
         Returns:
-            Sandbox: Sandbox information
-            
+            Sandbox: Sandbox 信息
+
         Raises:
-            HTTPException: If sandbox not found
+            HTTPException: 如果 sandbox 未找到
         """
         try:
             workload = self.workload_provider.get_workload(
                 sandbox_id=sandbox_id,
                 namespace=self.namespace,
             )
-            
+
             if not workload:
                 raise HTTPException(
                     status_code=status.HTTP_404_NOT_FOUND,
                     detail={
                         "code": SandboxErrorCodes.K8S_SANDBOX_NOT_FOUND,
-                        "message": f"Sandbox '{sandbox_id}' not found",
+                        "message": f"Sandbox '{sandbox_id}' 未找到",
                     },
                 )
-            
+
             return self._build_sandbox_from_workload(workload)
-            
+
         except HTTPException:
             raise
         except Exception as e:
-            logger.error(f"Error getting sandbox {sandbox_id}: {e}")
+            logger.error(f"获取 sandbox {sandbox_id} 时出错：{e}")
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail={
                     "code": SandboxErrorCodes.K8S_API_ERROR,
-                    "message": f"Failed to get sandbox: {str(e)}",
+                    "message": f"获取 sandbox 失败：{str(e)}",
                 },
             ) from e
-    
+
     def list_sandboxes(self, request: ListSandboxesRequest) -> ListSandboxesResponse:
         """
-        List sandboxes with filtering and pagination.
-        
+        列出 sandbox，支持过滤和分页。
+
         Args:
-            request: List request with filters and pagination
-            
+            request: 包含过滤器和分页信息的列表请求
+
         Returns:
-            ListSandboxesResponse: Paginated list of sandboxes
+            ListSandboxesResponse: 分页的 sandbox 列表
         """
         try:
-            # Build label selector
+            # 构建标签选择器
             label_selector = SANDBOX_ID_LABEL
-            
-            # List all workloads
+
+            # 列出所有工作负载
             workloads = self.workload_provider.list_workloads(
                 namespace=self.namespace,
                 label_selector=label_selector,
             )
-            
-            # Convert to Sandbox objects
+
+            # 转换为 Sandbox 对象
             sandboxes = [
                 self._build_sandbox_from_workload(w) for w in workloads
             ]
-            
-            # Apply filters
+
+            # 应用过滤器
             filtered = self._apply_filters(sandboxes, request.filter)
-            
-            # Sort by creation time (newest first)
+
+            # 按创建时间排序（最新的在前）
             filtered.sort(key=lambda s: s.created_at or datetime.min, reverse=True)
-            
-            # Apply pagination
+
+            # 应用分页
             total_items = len(filtered)
             page = request.pagination.page
             page_size = request.pagination.page_size
-            
+
             start_idx = (page - 1) * page_size
             end_idx = start_idx + page_size
             paginated_items = filtered[start_idx:end_idx]
-            
+
             total_pages = (total_items + page_size - 1) // page_size
             has_next = page < total_pages
-            
+
             return ListSandboxesResponse(
                 items=paginated_items,
                 pagination=PaginationInfo(
@@ -492,126 +543,126 @@ class KubernetesSandboxService(SandboxService):
                     has_next_page=has_next,
                 ),
             )
-            
+
         except Exception as e:
-            logger.error(f"Error listing sandboxes: {e}")
+            logger.error(f"列出 sandbox 时出错：{e}")
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail={
                     "code": SandboxErrorCodes.K8S_API_ERROR,
-                    "message": f"Failed to list sandboxes: {str(e)}",
+                    "message": f"列出 sandbox 失败：{str(e)}",
                 },
             ) from e
-    
+
     def delete_sandbox(self, sandbox_id: str) -> None:
         """
-        Delete a sandbox.
-        
+        删除 sandbox。
+
         Args:
-            sandbox_id: Unique sandbox identifier
-            
+            sandbox_id: Sandbox 唯一标识符
+
         Raises:
-            HTTPException: If deletion fails
+            HTTPException: 如果删除失败
         """
         try:
             self.workload_provider.delete_workload(
                 sandbox_id=sandbox_id,
                 namespace=self.namespace,
             )
-            
-            logger.info(f"Deleted sandbox: {sandbox_id}")
-            
+
+            logger.info(f"删除了 sandbox：{sandbox_id}")
+
         except Exception as e:
             if "not found" in str(e).lower():
                 raise HTTPException(
                     status_code=status.HTTP_404_NOT_FOUND,
                     detail={
                         "code": SandboxErrorCodes.K8S_SANDBOX_NOT_FOUND,
-                        "message": f"Sandbox '{sandbox_id}' not found",
+                        "message": f"Sandbox '{sandbox_id}' 未找到",
                     },
                 ) from e
-            
-            logger.error(f"Error deleting sandbox {sandbox_id}: {e}")
+
+            logger.error(f"删除 sandbox {sandbox_id} 时出错：{e}")
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail={
                     "code": SandboxErrorCodes.K8S_API_ERROR,
-                    "message": f"Failed to delete sandbox: {str(e)}",
+                    "message": f"删除 sandbox 失败：{str(e)}",
                 },
             ) from e
-    
+
     def pause_sandbox(self, sandbox_id: str) -> None:
         """
-        Pause sandbox (not supported in Kubernetes).
-        
+        暂停 sandbox（Kubernetes 不支持）。
+
         Args:
-            sandbox_id: Unique sandbox identifier
-            
+            sandbox_id: Sandbox 唯一标识符
+
         Raises:
-            HTTPException: Always raises 501 Not Implemented
+            HTTPException: 始终抛出 501 Not Implemented
         """
         raise HTTPException(
             status_code=status.HTTP_501_NOT_IMPLEMENTED,
             detail={
                 "code": SandboxErrorCodes.API_NOT_SUPPORTED,
-                "message": "Pause operation is not supported in Kubernetes runtime",
+                "message": "Kubernetes 运行时不支持 Pause 操作",
             },
         )
-    
+
     def resume_sandbox(self, sandbox_id: str) -> None:
         """
-        Resume sandbox (not supported in Kubernetes).
-        
+        恢复 sandbox（Kubernetes 不支持）。
+
         Args:
-            sandbox_id: Unique sandbox identifier
-            
+            sandbox_id: Sandbox 唯一标识符
+
         Raises:
-            HTTPException: Always raises 501 Not Implemented
+            HTTPException: 始终抛出 501 Not Implemented
         """
         raise HTTPException(
             status_code=status.HTTP_501_NOT_IMPLEMENTED,
             detail={
                 "code": SandboxErrorCodes.API_NOT_SUPPORTED,
-                "message": "Resume operation is not supported in Kubernetes runtime",
+                "message": "Kubernetes 运行时不支持 Resume 操作",
             },
         )
-    
+
     def renew_expiration(
         self,
         sandbox_id: str,
         request: RenewSandboxExpirationRequest,
     ) -> RenewSandboxExpirationResponse:
         """
-        Renew sandbox expiration time.
-        
-        Updates both the BatchSandbox spec.expireTime and label for consistency.
-        
+        更新 sandbox 过期时间。
+
+        同时更新 BatchSandbox spec.expireTime 字段和标签以保持一致性。
+
         Args:
-            sandbox_id: Unique sandbox identifier
-            request: Renewal request with new expiration time
-            
+            sandbox_id: Sandbox 唯一标识符
+            request: 包含新过期时间的更新请求
+
         Returns:
-            RenewSandboxExpirationResponse: Updated expiration time
-            
+            RenewSandboxExpirationResponse: 更新后的过期时间
+
         Raises:
-            HTTPException: If renewal fails
+            HTTPException: 如果更新失败
         """
-        # Validate future expiration
+        # 验证过期时间是未来时间
         new_expiration = ensure_future_expiration(request.expires_at)
-        
+
         try:
-            # Verify sandbox exists
+            # 验证 sandbox 存在
             workload = self.workload_provider.get_workload(
                 sandbox_id=sandbox_id,
                 namespace=self.namespace,
             )
-            
+
             if not workload:
                 raise HTTPException(
                     status_code=status.HTTP_404_NOT_FOUND,
                     detail={
                         "code": SandboxErrorCodes.K8S_SANDBOX_NOT_FOUND,
-                        "message": f"Sandbox '{sandbox_id}' not found",
+                        "message": f"Sandbox '{sandbox_id}' 未找到",
                     },
                 )
 
@@ -621,37 +672,37 @@ class KubernetesSandboxService(SandboxService):
                     status_code=status.HTTP_409_CONFLICT,
                     detail={
                         "code": SandboxErrorCodes.INVALID_EXPIRATION,
-                        "message": f"Sandbox {sandbox_id} does not have automatic expiration enabled.",
+                        "message": f"Sandbox {sandbox_id} 未启用自动过期。",
                     },
                 )
 
-            # Update BatchSandbox spec.expireTime field
+            # 更新 BatchSandbox spec.expireTime 字段
             self.workload_provider.update_expiration(
                 sandbox_id=sandbox_id,
                 namespace=self.namespace,
                 expires_at=new_expiration,
             )
-            
+
             logger.info(
-                f"Renewed sandbox {sandbox_id} expiration to {new_expiration}"
+                f"更新了 sandbox {sandbox_id} 的过期时间为 {new_expiration}"
             )
-            
+
             return RenewSandboxExpirationResponse(
                 expires_at=new_expiration
             )
-            
+
         except HTTPException:
             raise
         except Exception as e:
-            logger.error(f"Error renewing expiration for {sandbox_id}: {e}")
+            logger.error(f"为 {sandbox_id} 更新过期时间时出错：{e}")
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail={
                     "code": SandboxErrorCodes.K8S_API_ERROR,
-                    "message": f"Failed to renew expiration: {str(e)}",
+                    "message": f"更新过期时间失败：{str(e)}",
                 },
             ) from e
-    
+
     def get_endpoint(
         self,
         sandbox_id: str,
@@ -659,70 +710,74 @@ class KubernetesSandboxService(SandboxService):
         resolve_internal: bool = False,
     ) -> Endpoint:
         """
-        Get sandbox access endpoint.
-        
+        获取 sandbox 访问端点。
+
         Args:
-            sandbox_id: Unique sandbox identifier
-            port: Port number
-            resolve_internal: Ignored for Kubernetes (always returns Pod IP)
-            
+            sandbox_id: Sandbox 唯一标识符
+            port: 端口号
+            resolve_internal: 对 Kubernetes 忽略（始终返回 Pod IP）
+
         Returns:
-            Endpoint: Endpoint information
-            
+            Endpoint: 端点信息
+
         Raises:
-            HTTPException: If endpoint not available
+            HTTPException: 如果端点不可用
         """
         self.validate_port(port)
-        
+
         try:
             workload = self.workload_provider.get_workload(
                 sandbox_id=sandbox_id,
                 namespace=self.namespace,
             )
-            
+
             if not workload:
                 raise HTTPException(
                     status_code=status.HTTP_404_NOT_FOUND,
                     detail={
                         "code": SandboxErrorCodes.K8S_SANDBOX_NOT_FOUND,
-                        "message": f"Sandbox '{sandbox_id}' not found",
+                        "message": f"Sandbox '{sandbox_id}' 未找到",
                     },
                 )
-            
+
             endpoint = self.workload_provider.get_endpoint_info(workload, port, sandbox_id)
             if not endpoint:
                 raise HTTPException(
                     status_code=status.HTTP_404_NOT_FOUND,
                     detail={
                         "code": SandboxErrorCodes.K8S_POD_IP_NOT_AVAILABLE,
-                        "message": "Pod IP is not yet available. The Pod may still be starting.",
+                        "message": "Pod IP 还不可用。Pod 可能还在启动中。",
                     },
                 )
             return endpoint
-            
+
         except HTTPException:
             raise
         except Exception as e:
-            logger.error(f"Error getting endpoint for {sandbox_id}:{port}: {e}")
+            logger.error(f"获取 {sandbox_id}:{port} 端点时出错：{e}")
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail={
                     "code": SandboxErrorCodes.K8S_API_ERROR,
-                    "message": f"Failed to get endpoint: {str(e)}",
+                    "message": f"获取端点失败：{str(e)}",
                 },
             ) from e
-    
+
     def _build_sandbox_from_workload(self, workload: Any) -> Sandbox:
         """
-        Build Sandbox object from Kubernetes workload.
-        
+        从 Kubernetes 工作负载构建 Sandbox 对象。
+
+        支持两种格式：
+        - 字典格式（CRD）
+        - 对象格式（Pod）
+
         Args:
-            workload: Kubernetes workload object (V1Pod or dict for CRD)
-            
+            workload: Kubernetes 工作负载对象（V1Pod 或 CRD 字典）
+
         Returns:
-            Sandbox: Sandbox object
+            Sandbox: Sandbox 对象
         """
-        # Handle both dict (CRD) and object (Pod) formats
+        # 处理字典（CRD）和对象（Pod）两种格式
         if isinstance(workload, dict):
             metadata = workload.get("metadata", {})
             spec = workload.get("spec", {})
@@ -733,27 +788,27 @@ class KubernetesSandboxService(SandboxService):
             spec = workload.spec
             labels = metadata.labels or {}
             creation_timestamp = metadata.creation_timestamp
-        
+
         sandbox_id = labels.get(SANDBOX_ID_LABEL, "")
-        
-        # Get expiration from provider
+
+        # 从提供者获取过期时间
         expires_at = self.workload_provider.get_expiration(workload)
-        
-        # Get status
+
+        # 获取状态
         status_info = self.workload_provider.get_status(workload)
-        
-        # Extract metadata (filter out system labels)
+
+        # 提取元数据（过滤系统标签）
         user_metadata = {
             k: v for k, v in labels.items()
             if not k.startswith("opensandbox.io/")
         }
-        
-        # Get image and entrypoint from spec
+
+        # 从 spec 获取镜像和入口点
         image_uri = ""
         entrypoint = []
-        
+
         if isinstance(workload, dict):
-            # For CRD, extract from template
+            # 对于 CRD，从 template 提取
             template = spec.get("template") or spec.get("podTemplate") or {}
             pod_spec = template.get("spec", {})
             containers = pod_spec.get("containers", [])
@@ -762,14 +817,14 @@ class KubernetesSandboxService(SandboxService):
                 image_uri = container.get("image", "")
                 entrypoint = container.get("command", [])
         else:
-            # For Pod object
+            # 对于 Pod 对象
             if hasattr(spec, 'containers') and spec.containers:
                 container = spec.containers[0]
                 image_uri = container.image or ""
                 entrypoint = container.command or []
-        
+
         image_spec = ImageSpec(uri=image_uri) if image_uri else ImageSpec(uri="unknown")
-        
+
         return Sandbox(
             id=sandbox_id,
             status=SandboxStatus(
@@ -784,24 +839,24 @@ class KubernetesSandboxService(SandboxService):
             image=image_spec,
             entrypoint=entrypoint,
         )
-    
+
     def _apply_filters(self, sandboxes: list[Sandbox], filter_spec: Any) -> list[Sandbox]:
         """
-        Apply filters to sandbox list.
-        
+        将过滤器应用到 sandbox 列表。
+
         Args:
-            sandboxes: List of sandboxes
-            filter_spec: Filter specification
-            
+            sandboxes: Sandbox 列表
+            filter_spec: 过滤器规范
+
         Returns:
-            Filtered list of sandboxes
+            list[Sandbox]: 过滤后的 sandbox 列表
         """
         if not filter_spec:
             return sandboxes
-        
+
         filtered = []
         for sandbox in sandboxes:
             if matches_filter(sandbox, filter_spec):
                 filtered.append(sandbox)
-        
+
         return filtered

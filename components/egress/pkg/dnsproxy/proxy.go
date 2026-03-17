@@ -12,6 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// DNS 代理实现。
+//
+// 本文件实现了 DNS 代理的核心功能：
+// 1. 监听本地 DNS 请求（默认 127.0.0.1:15353）
+// 2. 根据网络策略允许或拒绝域名解析
+// 3. 转发允许的请求到上游 DNS 服务器
+// 4. 通知 DNS 解析结果（用于动态 nftables 规则）
+// 5. 通知被拒绝的域名（用于 webhook 通知）
 package dnsproxy
 
 import (
@@ -32,23 +40,32 @@ import (
 	"github.com/alibaba/opensandbox/egress/pkg/policy"
 )
 
+// 默认监听地址
 const defaultListenAddr = "127.0.0.1:15353"
 
+// Proxy DNS 代理结构体。
 type Proxy struct {
-	policyMu   sync.RWMutex
-	policy     *policy.NetworkPolicy
-	listenAddr string
-	upstream   string // single upstream for MVP
-	servers    []*dns.Server
+	policyMu   sync.RWMutex    // 保护策略的读写锁
+	policy     *policy.NetworkPolicy // 当前网络策略
+	listenAddr string          // 监听地址
+	upstream   string          // 上游 DNS 服务器地址
+	servers    []*dns.Server   // DNS 服务器实例（UDP 和 TCP）
 
-	// optional; called in goroutine when A/AAAA are present
+	// 可选回调；当 A/AAAA 记录存在时在 goroutine 中调用
 	onResolved func(domain string, ips []nftables.ResolvedIP)
 
-	// optional broadcaster to notify blocked hostnames
+	// 可选的事件广播器，用于通知被拒绝的域名
 	blockedBroadcaster *events.Broadcaster
 }
 
-// New builds a proxy with resolved upstream; listenAddr can be empty for default.
+// New 创建 DNS 代理实例。
+//
+// 参数：
+//   p: 初始网络策略（nil 使用默认拒绝所有）
+//   listenAddr: 监听地址（空字符串使用默认地址）
+//
+// 返回：
+//   DNS 代理实例和可能的错误
 func New(p *policy.NetworkPolicy, listenAddr string) (*Proxy, error) {
 	if listenAddr == "" {
 		listenAddr = defaultListenAddr
@@ -56,10 +73,13 @@ func New(p *policy.NetworkPolicy, listenAddr string) (*Proxy, error) {
 	if p == nil {
 		p = policy.DefaultDenyPolicy()
 	}
+
+	// 自动发现上游 DNS 服务器
 	upstream, err := discoverUpstream()
 	if err != nil {
 		return nil, err
 	}
+
 	proxy := &Proxy{
 		listenAddr: listenAddr,
 		upstream:   upstream,
@@ -68,13 +88,22 @@ func New(p *policy.NetworkPolicy, listenAddr string) (*Proxy, error) {
 	return proxy, nil
 }
 
+// Start 启动 DNS 代理服务器。
+//
+// 参数：
+//   ctx: 上下文，用于优雅关闭
+//
+// 返回：
+//   启动错误（如有）
 func (p *Proxy) Start(ctx context.Context) error {
 	handler := dns.HandlerFunc(p.serveDNS)
 
+	// 创建 UDP 和 TCP DNS 服务器
 	udpServer := &dns.Server{Addr: p.listenAddr, Net: "udp", Handler: handler}
 	tcpServer := &dns.Server{Addr: p.listenAddr, Net: "tcp", Handler: handler}
 	p.servers = []*dns.Server{udpServer, tcpServer}
 
+	// 在后台启动服务器
 	errCh := make(chan error, len(p.servers))
 	for _, srv := range p.servers {
 		s := srv
@@ -85,7 +114,7 @@ func (p *Proxy) Start(ctx context.Context) error {
 		}()
 	}
 
-	// Shutdown on context done
+	// 上下文结束时关闭服务器
 	go func() {
 		<-ctx.Done()
 		for _, srv := range p.servers {
@@ -93,26 +122,37 @@ func (p *Proxy) Start(ctx context.Context) error {
 		}
 	}()
 
+	// 等待启动完成或错误
 	select {
 	case err := <-errCh:
 		return fmt.Errorf("dns proxy failed: %w", err)
 	case <-time.After(200 * time.Millisecond):
-		// small grace window; running fine
+		// 小延迟确认启动成功
 		return nil
 	}
 }
 
+// serveDNS 处理 DNS 请求。
+//
+// 处理流程：
+// 1. 检查域名是否被策略拒绝
+// 2. 如果拒绝，返回 NXDOMAIN
+// 3. 如果允许，转发到上游 DNS 服务器
+// 4. 通知 DNS 解析结果（如有回调）
 func (p *Proxy) serveDNS(w dns.ResponseWriter, r *dns.Msg) {
 	if len(r.Question) == 0 {
-		_ = w.WriteMsg(new(dns.Msg)) // empty response
+		_ = w.WriteMsg(new(dns.Msg)) // 空响应
 		return
 	}
 	q := r.Question[0]
 	domain := q.Name
 
+	// 获取当前策略
 	p.policyMu.RLock()
 	currentPolicy := p.policy
 	p.policyMu.RUnlock()
+
+	// 评估域名是否被拒绝
 	if currentPolicy != nil && currentPolicy.Evaluate(domain) == policy.ActionDeny {
 		p.publishBlocked(domain)
 		resp := new(dns.Msg)
@@ -121,6 +161,7 @@ func (p *Proxy) serveDNS(w dns.ResponseWriter, r *dns.Msg) {
 		return
 	}
 
+	// 转发到上游 DNS 服务器
 	resp, err := p.forward(r)
 	if err != nil {
 		log.Warnf("[dns] forward error for %s: %v", domain, err)
@@ -129,12 +170,16 @@ func (p *Proxy) serveDNS(w dns.ResponseWriter, r *dns.Msg) {
 		_ = w.WriteMsg(fail)
 		return
 	}
+
+	// 通知 DNS 解析结果
 	p.maybeNotifyResolved(domain, resp)
 	_ = w.WriteMsg(resp)
 }
 
-// maybeNotifyResolved calls onResolved synchronously when resp contains A/AAAA,
-// so that IPs are in nft before the client receives the DNS response and connects.
+// maybeNotifyResolved 在响应包含 A/AAAA 记录时调用 onResolved 回调。
+//
+// 这样在客户端收到 DNS 响应并建立连接之前，
+// IP 已经被添加到 nftables 允许集合中。
 func (p *Proxy) maybeNotifyResolved(domain string, resp *dns.Msg) {
 	if p.onResolved == nil {
 		return
@@ -146,6 +191,7 @@ func (p *Proxy) maybeNotifyResolved(domain string, resp *dns.Msg) {
 	p.onResolved(domain, ips)
 }
 
+// forward 将 DNS 请求转发到上游服务器。
 func (p *Proxy) forward(r *dns.Msg) (*dns.Msg, error) {
 	c := &dns.Client{
 		Timeout: 5 * time.Second,
@@ -155,7 +201,7 @@ func (p *Proxy) forward(r *dns.Msg) (*dns.Msg, error) {
 	return resp, err
 }
 
-// UpstreamHost returns the host part of the upstream resolver, empty on parse error.
+// UpstreamHost 返回上游 DNS 服务器的主机部分。
 func (p *Proxy) UpstreamHost() string {
 	host, _, err := net.SplitHostPort(p.upstream)
 	if err != nil {
@@ -164,32 +210,38 @@ func (p *Proxy) UpstreamHost() string {
 	return host
 }
 
-// UpdatePolicy swaps the in-memory policy used by the proxy.
-// Passing nil reverts to the default deny-all policy.
+// UpdatePolicy 更新代理使用的网络策略。
+//
+// 参数：
+//   newPolicy: 新策略（nil 回退到默认拒绝所有）
 func (p *Proxy) UpdatePolicy(newPolicy *policy.NetworkPolicy) {
 	p.policyMu.Lock()
 	p.policy = ensurePolicyDefaults(newPolicy)
 	p.policyMu.Unlock()
 }
 
-// CurrentPolicy returns the policy currently enforced by the proxy.
+// CurrentPolicy 返回当前生效的网络策略。
 func (p *Proxy) CurrentPolicy() *policy.NetworkPolicy {
 	p.policyMu.RLock()
 	defer p.policyMu.RUnlock()
 	return p.policy
 }
 
-// SetOnResolved sets the callback invoked when an allowed domain resolves to A/AAAA.
-// Called in a goroutine; pass nil to disable. Only used when L2 dynamic IP is enabled (e.g. dns+nft mode).
+// SetOnResolved 设置 DNS 解析结果回调。
+//
+// 当允许的域名解析到 A/AAAA 记录时调用此回调。
+// 在 goroutine 中调用；传 nil 禁用。
+// 仅在 L2 动态 IP 启用时使用（如 dns+nft 模式）。
 func (p *Proxy) SetOnResolved(fn func(domain string, ips []nftables.ResolvedIP)) {
 	p.onResolved = fn
 }
 
-// SetBlockedBroadcaster wires a broadcaster used to notify blocked hostnames.
+// SetBlockedBroadcaster 设置被拒绝域名的事件广播器。
 func (p *Proxy) SetBlockedBroadcaster(b *events.Broadcaster) {
 	p.blockedBroadcaster = b
 }
 
+// publishBlocked 发布被拒绝的域名到广播器。
 func (p *Proxy) publishBlocked(domain string) {
 	if p.blockedBroadcaster == nil {
 		return
@@ -205,10 +257,10 @@ func (p *Proxy) publishBlocked(domain string) {
 	})
 }
 
-// extractResolvedIPs parses A and AAAA records from resp.Answer into ResolvedIP slice.
+// extractResolvedIPs 从 DNS 响应中提取 A 和 AAAA 记录。
 //
-// Uses netip.ParseAddr(v.A.String()) which allocates a temporary string per record; typically
-// one or a few records per resolution, so the cost is small compared to DNS RTT and nft writes.
+// 使用 netip.ParseAddr(v.A.String()) 为每条记录分配临时字符串；
+// 通常每条解析只有一到几条记录，成本相比 DNS RTT 和 nft 写入很小。
 func extractResolvedIPs(resp *dns.Msg) []nftables.ResolvedIP {
 	if resp == nil || len(resp.Answer) == 0 {
 		return nil
@@ -240,8 +292,14 @@ func extractResolvedIPs(resp *dns.Msg) []nftables.ResolvedIP {
 	return out
 }
 
+// 备用的上游 DNS 服务器（当 /etc/resolv.conf 无法解析时使用）
 const fallbackUpstream = "8.8.8.8:53"
 
+// discoverUpstream 自动发现上游 DNS 服务器。
+//
+// 优先选择第一个非回环 nameserver（如 K8s 集群 DNS 在 127.0.0.11 之后）。
+// 如果只有回环地址（如 Docker 127.0.0.11），使用它：代理的上游流量会被标记并绕过重定向，
+// 所以回环地址在 sidecar 中是可达的。
 func discoverUpstream() (string, error) {
 	cfg, err := dns.ClientConfigFromFile("/etc/resolv.conf")
 	if err != nil || len(cfg.Servers) == 0 {
@@ -250,9 +308,8 @@ func discoverUpstream() (string, error) {
 		}
 		return fallbackUpstream, nil
 	}
-	// Prefer first non-loopback nameserver (e.g. K8s cluster DNS after 127.0.0.11).
-	// If only loopback exists (e.g. Docker 127.0.0.11), use it: proxy upstream traffic
-	// is marked and bypasses the redirect, so loopback is reachable from the sidecar.
+
+	// 选择第一个非回环 nameserver
 	var chosen string
 	for _, s := range cfg.Servers {
 		if ip := net.ParseIP(s); ip != nil && ip.IsLoopback() {
@@ -270,8 +327,15 @@ func discoverUpstream() (string, error) {
 	return net.JoinHostPort(chosen, cfg.Port), nil
 }
 
-// ResolvNameserverIPs reads nameserver lines from resolvPath and returns parsed IPv4/IPv6 addresses.
-// Used at startup to whitelist the system DNS so client traffic to it is allowed and proxy can use it as upstream.
+// ResolvNameserverIPs 从 resolv.conf 读取 nameserver 行并返回解析的 IPv4/IPv6 地址。
+//
+// 用于启动时白名单系统 DNS，确保客户端 DNS 流量被允许且代理可以将其作为上游使用。
+//
+// 参数：
+//   resolvPath: resolv.conf 文件路径
+//
+// 返回：
+//   nameserver IP 列表和可能的错误
 func ResolvNameserverIPs(resolvPath string) ([]netip.Addr, error) {
 	cfg, err := dns.ClientConfigFromFile(resolvPath)
 	if err != nil || len(cfg.Servers) == 0 {
@@ -288,7 +352,13 @@ func ResolvNameserverIPs(resolvPath string) ([]netip.Addr, error) {
 	return out, nil
 }
 
-// LoadPolicyFromEnvVar reads the given env var and parses a policy; empty falls back to default deny-all.
+// LoadPolicyFromEnvVar 从环境变量读取并解析网络策略。
+//
+// 参数：
+//   envName: 环境变量名称
+//
+// 返回：
+//   解析后的策略和可能的错误
 func LoadPolicyFromEnvVar(envName string) (*policy.NetworkPolicy, error) {
 	raw := os.Getenv(envName)
 	if raw == "" {
@@ -297,6 +367,7 @@ func LoadPolicyFromEnvVar(envName string) (*policy.NetworkPolicy, error) {
 	return policy.ParsePolicy(raw)
 }
 
+// ensurePolicyDefaults 确保策略有默认值。
 func ensurePolicyDefaults(p *policy.NetworkPolicy) *policy.NetworkPolicy {
 	if p == nil {
 		return policy.DefaultDenyPolicy()

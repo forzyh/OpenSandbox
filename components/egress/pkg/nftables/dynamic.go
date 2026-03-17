@@ -12,6 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// nftables 动态规则管理。
+//
+// 本文件定义用于动态 nftables 规则的数据结构和辅助函数，
+// 主要用于将 DNS 解析的 IP 地址动态添加到允许集合。
 package nftables
 
 import (
@@ -21,22 +25,29 @@ import (
 	"time"
 )
 
+// 动态集合配置常量
 const (
-	dynAllowV4Set  = "dyn_allow_v4"
-	dynAllowV6Set  = "dyn_allow_v6"
-	dynSetTimeoutS = 300
-	minTTLSec      = 60
-	maxTTLSec      = 300
+	dynAllowV4Set  = "dyn_allow_v4"  // IPv4 动态允许集合名称
+	dynAllowV6Set  = "dyn_allow_v6"  // IPv6 动态允许集合名称
+	dynSetTimeoutS = 300             // 动态集合条目超时时间（秒）
+	minTTLSec      = 60              // 最小 TTL（秒）
+	maxTTLSec      = 300             // 最大 TTL（秒）
 )
 
-// ResolvedIP is a single IP learned from DNS with TTL for dynamic nft set.
+// ResolvedIP 表示从 DNS 解析得到的 IP 地址及其 TTL。
 type ResolvedIP struct {
-	Addr netip.Addr
-	TTL  time.Duration
+	Addr netip.Addr    // IP 地址
+	TTL  time.Duration // DNS 记录的 TTL
 }
 
-// buildAddResolvedIPsScript returns a nft script fragment that
-// adds resolved IPs to dyn_allow_v4/v6 with timeout.
+// buildAddResolvedIPsScript 生成 nft 脚本片段，将解析的 IP 添加到动态允许集合。
+//
+// 参数：
+//   table: nftables 表名
+//   ips: 要添加的 IP 列表
+//
+// 返回：
+//   nft 脚本字符串
 func buildAddResolvedIPsScript(table string, ips []ResolvedIP) string {
 	var v4, v6 []string
 	for _, r := range ips {
@@ -57,6 +68,13 @@ func buildAddResolvedIPsScript(table string, ips []ResolvedIP) string {
 	return b.String()
 }
 
+// clampTTL 将 TTL 限制在允许范围内。
+//
+// 参数：
+//   d: 原始 TTL
+//
+// 返回：
+//   限制后的 TTL（秒）
 func clampTTL(d time.Duration) int {
 	sec := int(d.Seconds())
 	if sec < minTTLSec {

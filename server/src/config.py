@@ -13,10 +13,29 @@
 # limitations under the License.
 
 """
-Application configuration management for sandbox server.
+OpenSandbox 服务器应用配置管理模块。
 
-Loads configuration from a TOML file (default: ~/.sandbox.toml) and exposes
-helpers to access the parsed settings throughout the application.
+本模块负责从 TOML 配置文件中加载和管理应用程序的所有配置项。
+默认配置文件路径为 ~/.sandbox.toml，但可以通过环境变量 SANDBOX_CONFIG_PATH 覆盖。
+
+配置加载流程：
+1. 从指定的配置文件路径读取 TOML 格式的配置数据
+2. 使用 Pydantic 进行数据验证和类型转换
+3. 将验证后的配置存储为全局变量供其他模块使用
+
+配置结构采用分层设计：
+- server: FastAPI 服务器配置（端口、日志级别、API 密钥等）
+- runtime: 沙箱运行时配置（Docker 或 Kubernetes）
+- docker: Docker 特定配置（网络模式、安全设置等）
+- kubernetes: Kubernetes 特定配置（命名空间、服务账户等）
+- ingress: 入口配置（直接暴露或通过网关）
+- storage: 存储配置（主机路径允许列表、OSSFS 挂载根目录等）
+- secure_runtime: 安全运行时配置（gVisor、Kata、Firecracker）
+
+配置验证：
+- 使用 Pydantic 的 model_validator 进行跨字段验证
+- 确保配置项之间的兼容性（如 Docker 运行时不能配置 Kubernetes 特定选项）
+- 验证网络配置的有效性（IP 地址、域名格式等）
 """
 
 from __future__ import annotations
@@ -52,6 +71,15 @@ GATEWAY_ROUTE_MODE_URI = "uri"
 
 
 def _is_valid_ip(host: str) -> bool:
+    """
+    验证给定的字符串是否是有效的 IP 地址。
+
+    Args:
+        host: 要验证的主机字符串
+
+    Returns:
+        bool: 如果是有效的 IPv4 或 IPv6 地址返回 True，否则返回 False
+    """
     try:
         ipaddress.ip_address(host)
         return True
@@ -60,6 +88,15 @@ def _is_valid_ip(host: str) -> bool:
 
 
 def _is_valid_ip_or_ip_port(address: str) -> bool:
+    """
+    验证给定的字符串是否是有效的 IP 地址或 IP:端口格式。
+
+    Args:
+        address: 要验证的地址字符串，可以是 "192.168.1.1" 或 "192.168.1.1:8080" 格式
+
+    Returns:
+        bool: 如果是有效的 IP 或 IP:端口格式返回 True，否则返回 False
+    """
     match = _IPV4_WITH_PORT_RE.match(address)
     if not match:
         return False
@@ -77,15 +114,40 @@ def _is_valid_ip_or_ip_port(address: str) -> bool:
 
 
 def _is_valid_domain(host: str) -> bool:
+    """
+    验证给定的字符串是否是有效的域名。
+
+    Args:
+        host: 要验证的域名字符串
+
+    Returns:
+        bool: 如果是有效的域名格式返回 True，否则返回 False
+    """
     return bool(_DOMAIN_RE.match(host))
 
 
 def _is_wildcard_domain(host: str) -> bool:
+    """
+    验证给定的字符串是否是有效的通配符域名（以 *. 开头）。
+
+    Args:
+        host: 要验证的通配符域名字符串
+
+    Returns:
+        bool: 如果是有效的通配符域名格式返回 True，否则返回 False
+    """
     return bool(_WILDCARD_DOMAIN_RE.match(host))
 
 
 class GatewayRouteModeConfig(BaseModel):
-    """Routing strategy for gateway ingress exposure."""
+    """
+    网关路由模式配置。
+
+    定义网关如何处理传入的请求路由。支持三种模式：
+    - wildcard: 通配符域名路由（如 *.example.com）
+    - header: 基于请求头的路由
+    - uri: 基于 URI 路径的路由
+    """
 
     mode: Literal[
         GATEWAY_ROUTE_MODE_WILDCARD,
@@ -101,21 +163,42 @@ class GatewayRouteModeConfig(BaseModel):
 
 
 class GatewayConfig(BaseModel):
-    """Gateway mode configuration for ingress exposure."""
+    """
+    网关模式配置，用于入口暴露。
+
+    当沙箱需要通过网关暴露时使用此配置。网关地址可以是域名或 IP 地址，
+    可以包含端口号（但不包含协议前缀，由客户端决定使用 http 或 https）。
+
+    Attributes:
+        address: 网关主机地址，用于暴露沙箱（域名或 IP，可以包含 :端口，不允许包含协议前缀）
+        route: 网关使用的路由模式配置
+    """
 
     address: str = Field(
         ...,
-        description="Gateway host used to expose sandboxes (domain or IP, may include :port; scheme is not allowed).",
+        description="网关主机地址，用于暴露沙箱（域名或 IP，可以包含 :端口，不允许包含协议前缀）",
         min_length=1,
     )
     route: GatewayRouteModeConfig = Field(
         ...,
-        description="Routing mode configuration used by the gateway.",
+        description="网关使用的路由模式配置",
     )
 
 
 class IngressConfig(BaseModel):
-    """Configuration for exposing sandbox ingress."""
+    """
+    沙箱入口暴露配置。
+
+    定义沙箱如何对外暴露服务。支持两种模式：
+    - direct: 直接模式，沙箱直接使用主机网络或通过端口映射暴露
+    - gateway: 网关模式，沙箱通过统一的网关入口暴露，网关根据路由规则转发请求
+
+    验证规则：
+    - gateway 模式下必须提供 gateway 配置
+    - direct 模式下不能提供 gateway 配置
+    - gateway 模式下，如果使用 wildcard 路由模式，address 必须是通配符域名
+    - gateway 模式下，如果使用非 wildcard 路由模式，address 不能包含通配符
+    """
 
     mode: Literal[INGRESS_MODE_DIRECT, INGRESS_MODE_GATEWAY] = Field(
         default=INGRESS_MODE_DIRECT,
@@ -159,44 +242,86 @@ class IngressConfig(BaseModel):
 
 
 class ServerConfig(BaseModel):
-    """FastAPI server configuration."""
+    """
+    FastAPI 服务器配置。
+
+    定义生命周期 API 服务器的基本运行参数。
+
+    Attributes:
+        host: 生命周期 API 服务器绑定的网络接口地址，默认为 "0.0.0.0"（监听所有接口）
+        port: 生命周期 API 服务器暴露的端口号，范围 1-65535，默认 8080
+        log_level: 服务器进程的 Python 日志级别，如 "DEBUG"、"INFO"、"WARNING"、"ERROR"
+        api_key: 用于认证传入生命周期 API 调用的全局 API 密钥，可选
+        eip: 绑定的公共 IP 地址，设置后用于返回沙箱端点时作为主机部分
+        max_sandbox_timeout_seconds: 请求指定超时时间时允许的最大沙箱 TTL（秒），
+                                    如果不设置则禁用服务器端上限
+    """
 
     host: str = Field(
         default="0.0.0.0",
-        description="Interface bound by the lifecycle API server.",
+        description="生命周期 API 服务器绑定的网络接口地址",
         min_length=1,
     )
     port: int = Field(
         default=8080,
         ge=1,
         le=65535,
-        description="Port exposed by the lifecycle API server.",
+        description="生命周期 API 服务器暴露的端口号",
     )
     log_level: str = Field(
         default="INFO",
-        description="Python logging level for the server process.",
+        description="服务器进程的 Python 日志级别",
         min_length=3,
     )
     api_key: Optional[str] = Field(
         default=None,
-        description="Global API key for authenticating incoming lifecycle API calls.",
+        description="用于认证传入生命周期 API 调用的全局 API 密钥",
     )
     eip: Optional[str] = Field(
         default=None,
-        description="Bound public IP. When set, used as the host part when returning sandbox endpoints.",
+        description="绑定的公共 IP 地址，设置后用于返回沙箱端点时作为主机部分",
     )
     max_sandbox_timeout_seconds: Optional[int] = Field(
         default=None,
         ge=60,
         description=(
-            "Maximum allowed sandbox TTL in seconds for requests that specify timeout. "
-            "Omit from config to disable the server-side upper bound."
+            "请求指定超时时间时允许的最大沙箱 TTL（秒）。"
+            "如果不配置此项，则禁用服务器端上限。"
         ),
     )
 
 
 class KubernetesRuntimeConfig(BaseModel):
-    """Kubernetes-specific runtime configuration."""
+    """
+    Kubernetes 特定的运行时配置。
+
+    定义在 Kubernetes 环境中运行沙箱时的各种参数，包括：
+    - kubeconfig 配置路径
+    - informer 缓存设置
+    - API 请求速率限制
+    - 命名空间和服务账户配置
+    - 工作负载提供者类型
+    - execd 初始化容器资源限制
+
+    Attributes:
+        kubeconfig_path: 用于 API 认证的 kubeconfig 文件绝对路径，默认使用集群内服务账户
+        informer_enabled: [Beta] 启用 informer 支持的缓存用于工作负载读取，
+                          保持 watch 以减少 API 压力，设为 false 禁用
+        informer_resync_seconds: [Beta] informer 缓存的全量重新同步间隔（秒），
+                                 较短的间隔会更积极地刷新缓存
+        informer_watch_timeout_seconds: [Beta] 重启 informer 流之前的 watch 超时时间（秒）
+        read_qps: Kubernetes API 读取请求（get/list）的最大每秒请求数，0 表示无限制（不限速）
+        read_burst: 读取速率限制器的突发大小，0 表示使用 read_qps 作为突发值（最小为 1）
+        write_qps: Kubernetes API 写入请求（create/delete/patch）的最大每秒请求数，0 表示无限制
+        write_burst: 写入速率限制器的突发大小，0 表示使用 write_qps 作为突发值（最小为 1）
+        namespace: 沙箱工作负载使用的 Kubernetes 命名空间
+        service_account: 绑定到沙箱工作负载的服务账户
+        workload_provider: 工作负载提供者类型，如果不指定，使用第一个注册的提供者
+        batchsandbox_template_file: BatchSandbox CR YAML 模板文件路径，当 workload_provider 为 'batchsandbox' 时使用
+        sandbox_create_timeout_seconds: 创建后等待沙箱就绪（分配 IP）的超时时间（秒）
+        sandbox_create_poll_interval_seconds: 等待沙箱就绪时的轮询间隔（秒）
+        execd_init_resources: execd 初始化容器的资源请求/限制，如果不设置则不应用资源约束
+    """
 
     kubeconfig_path: Optional[str] = Field(
         default=None,

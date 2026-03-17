@@ -14,75 +14,59 @@
 
 package auth
 
-import (
-	"fmt"
-	"io"
-	"net/http"
+// 认证类型常量定义
+
+const (
+	// AuthTypeNone 表示无认证模式
+	AuthTypeNone = "none"
+
+	// AuthTypeToken 表示 Token 认证模式
+	AuthTypeToken = "token"
+
+	// AuthTypeBasic 表示 Basic Auth 认证模式
+	AuthTypeBasic = "basic"
+
+	// AuthHeaderKey 认证请求头键名
+	AuthHeaderKey = "Authorization"
+
+	// AuthHeaderValuePrefix Token 认证请求头值前缀（"token "）
+	AuthHeaderValuePrefix = "token "
+
+	// AuthURLParamKey URL 查询参数中 token 的键名
+	AuthURLParamKey = "token"
 )
 
-// Client wraps http.Client and injects auth headers.
-type Client struct {
-	httpClient *http.Client
-	auth       *Auth
+// NewAuth 创建一个新的空认证配置
+//
+// 返回值:
+//   - *Auth: 空的认证对象，所有字段均为零值
+//
+// 使用示例:
+//
+//	auth := auth.NewAuth()
+//	auth.Token = "my-token"
+func NewAuth() *Auth {
+	return &Auth{}
 }
 
-// NewClient creates a new authenticated HTTP client.
-func NewClient(httpClient *http.Client, auth *Auth) *Client {
-	return &Client{
-		httpClient: httpClient,
-		auth:       auth,
-	}
+// IsValid 检查认证配置是否有效
+//
+// 有效认证配置定义为：
+//   - Token 非空（Token 认证）
+//   - 或 Username 和 Password 均非空（Basic 认证）
+//
+// 返回值:
+//   - bool: 配置是否有效
+func (a *Auth) IsValid() bool {
+	return a.Token != "" || (a.Username != "" && a.Password != "")
 }
 
-// Do sends an HTTP request and automatically adds authentication data.
-func (c *Client) Do(req *http.Request) (*http.Response, error) {
-	if c.auth == nil {
-		return c.httpClient.Do(req)
-	}
-
-	if c.auth.Token != "" {
-		req.Header.Set("Authorization", fmt.Sprintf("token %s", c.auth.Token))
-	} else if c.auth.Username != "" {
-		req.SetBasicAuth(c.auth.Username, c.auth.Password)
-	}
-
-	return c.httpClient.Do(req)
-}
-
-// Get sends a GET request.
-func (c *Client) Get(url string) (*http.Response, error) {
-	req, err := http.NewRequest(http.MethodGet, url, nil)
-	if err != nil {
-		return nil, err
-	}
-	return c.Do(req)
-}
-
-// Post sends a POST request.
-func (c *Client) Post(url, contentType string, body io.Reader) (*http.Response, error) {
-	req, err := http.NewRequest(http.MethodPut, url, body)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Content-Type", contentType)
-	return c.Do(req)
-}
-
-// Put sends a PUT request.
-func (c *Client) Put(url, contentType string, body io.Reader) (*http.Response, error) {
-	req, err := http.NewRequest(http.MethodPut, url, body)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Content-Type", contentType)
-	return c.Do(req)
-}
-
-// Delete sends a DELETE request.
-func (c *Client) Delete(url string) (*http.Response, error) {
-	req, err := http.NewRequest(http.MethodDelete, url, nil)
-	if err != nil {
-		return nil, err
-	}
-	return c.Do(req)
+// GetAuthType 获取认证类型
+//
+// 本方法是 Validate() 方法的别名，用于获取当前认证配置的类型。
+//
+// 返回值:
+//   - string: 认证类型（"token"、"basic" 或 "none"）
+func (a *Auth) GetAuthType() string {
+	return a.Validate()
 }

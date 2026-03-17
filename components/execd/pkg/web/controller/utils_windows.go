@@ -30,6 +30,16 @@ import (
 	"github.com/alibaba/opensandbox/execd/pkg/web/model"
 )
 
+// DeleteFile 删除指定文件（Windows 版本）
+//
+// 本函数删除指定路径的文件。如果文件不存在，不返回错误。
+// 如果路径是目录，返回错误。
+//
+// 参数:
+//   - filePath: 文件路径
+//
+// 返回值:
+//   - error: 删除错误（如有）
 func DeleteFile(filePath string) error {
 	absPath, err := filepath.Abs(filePath)
 	if err != nil {
@@ -55,6 +65,16 @@ func DeleteFile(filePath string) error {
 	return nil
 }
 
+// ChmodFile 修改文件权限（Windows 版本）
+//
+// 本函数设置文件的权限模式。在 Windows 上，所有权设置被忽略。
+//
+// 参数:
+//   - file: 文件路径
+//   - perms: 权限设置
+//
+// 返回值:
+//   - error: 设置错误（如有）
 func ChmodFile(file string, perms model.Permission) error {
 	abs, err := filepath.Abs(file)
 	if err != nil {
@@ -74,12 +94,33 @@ func ChmodFile(file string, perms model.Permission) error {
 	return SetFileOwnership(abs, perms.Owner, perms.Group)
 }
 
-// SetFileOwnership is a placeholder on Windows where POSIX ownership is not supported.
+// SetFileOwnership 设置文件所有权（Windows 版本）
+//
+// Windows 不支持 POSIX 所有权模型，此函数是占位符实现。
+// 如需完整的 Windows ACL 支持，需要额外实现。
+//
+// 参数:
+//   - _: 文件路径（未使用）
+//   - _: 所有者（未使用）
+//   - _: 组（未使用）
+//
+// 返回值:
+//   - error: 始终返回 nil
 func SetFileOwnership(_ string, _ string, _ string) error {
-	// TODO: add Windows ACL support if needed.
+	// TODO: 如需支持 Windows ACL，可在此处添加实现
 	return nil
 }
 
+// RenameFile 重命名/移动文件（Windows 版本）
+//
+// 本函数将文件从源路径移动到目标路径。
+// 如果目标目录不存在，会自动创建。
+//
+// 参数:
+//   - item: 重命名操作项
+//
+// 返回值:
+//   - error: 重命名错误（如有）
 func RenameFile(item model.RenameFileItem) error {
 	srcPath, err := filepath.Abs(item.Src)
 	if err != nil {
@@ -112,6 +153,16 @@ func RenameFile(item model.RenameFileItem) error {
 	return nil
 }
 
+// MakeDir 创建目录（Windows 版本）
+//
+// 本函数创建指定目录及其父目录，并设置权限。
+//
+// 参数:
+//   - dir: 目录路径
+//   - perm: 权限设置
+//
+// 返回值:
+//   - error: 创建错误（如有）
 func MakeDir(dir string, perm model.Permission) error {
 	abs, err := filepath.Abs(dir)
 	if err != nil {
@@ -125,6 +176,17 @@ func MakeDir(dir string, perm model.Permission) error {
 	return ChmodFile(abs, perm)
 }
 
+// GetFileInfo 获取文件信息（Windows 版本）
+//
+// 本函数获取文件的详细信息，包括大小、时间和权限。
+// Windows 版本返回空的 Owner 和 Group 字段。
+//
+// 参数:
+//   - filePath: 文件路径
+//
+// 返回值:
+//   - model.FileInfo: 文件信息
+//   - error: 获取错误（如有）
 func GetFileInfo(filePath string) (model.FileInfo, error) {
 	absPath, err := filepath.Abs(filePath)
 	if err != nil {
@@ -139,6 +201,7 @@ func GetFileInfo(filePath string) (model.FileInfo, error) {
 		return model.FileInfo{}, fmt.Errorf("error accessing file %s: %w", filePath, err)
 	}
 
+	// Windows 使用 Win32FileAttributeData 获取创建时间
 	createdAt := getFileCreateTime(fileInfo)
 	if data, ok := fileInfo.Sys().(*syscall.Win32FileAttributeData); ok && data != nil {
 		createdAt = time.Unix(0, data.CreationTime.Nanoseconds())
@@ -162,6 +225,18 @@ func GetFileInfo(filePath string) (model.FileInfo, error) {
 	}, nil
 }
 
+// SearchFileMetadata 在元数据映射中搜索文件
+//
+// 本函数通过文件名（而非完整路径）在元数据映射中搜索匹配项。
+//
+// 参数:
+//   - metadata: 元数据映射
+//   - filePath: 要搜索的文件路径
+//
+// 返回值:
+//   - string: 匹配的路径
+//   - model.FileMetadata: 元数据
+//   - bool: 是否找到
 func SearchFileMetadata(metadata map[string]model.FileMetadata, filePath string) (string, model.FileMetadata, bool) {
 	base := filepath.Base(filePath)
 	for path, info := range metadata {
@@ -173,10 +248,25 @@ func SearchFileMetadata(metadata map[string]model.FileMetadata, filePath string)
 	return "", model.FileMetadata{}, false
 }
 
+// httpRange 表示 HTTP Range 请求的范围
 type httpRange struct {
 	start, length int64
 }
 
+// ParseRange 解析 HTTP Range 请求头
+//
+// 本函数解析 Range 请求头，支持以下格式：
+//   - bytes=start-end: 指定起始和结束位置
+//   - bytes=start-: 从 start 到文件末尾
+//   - bytes=-n: 文件末尾的 n 个字节
+//
+// 参数:
+//   - s: Range 请求头字符串
+//   - size: 文件大小
+//
+// 返回值:
+//   - []httpRange: 解析后的范围列表
+//   - error: 解析错误（如有）
 func ParseRange(s string, size int64) ([]httpRange, error) {
 	if !strings.HasPrefix(s, "bytes=") {
 		return nil, errors.New("invalid range")
@@ -198,7 +288,7 @@ func ParseRange(s string, size int64) ([]httpRange, error) {
 		var r httpRange
 
 		if start == "" {
-			// suffix-length
+			// suffix-length 格式：-n
 			n, err := strconv.ParseInt(end, 10, 64)
 			if err != nil || n < 0 {
 				return nil, errors.New("invalid range")
@@ -209,17 +299,17 @@ func ParseRange(s string, size int64) ([]httpRange, error) {
 			r.start = size - n
 			r.length = size - r.start
 		} else {
-			// start-end
+			// start-end 或 start- 格式
 			i, err := strconv.ParseInt(start, 10, 64)
 			if err != nil || i < 0 {
 				return nil, errors.New("invalid range")
 			}
 			if end == "" {
-				// start-
+				// start- 格式
 				r.start = i
 				r.length = size - i
 			} else {
-				// start-end
+				// start-end 格式
 				j, err := strconv.ParseInt(end, 10, 64)
 				if err != nil || j < i {
 					return nil, errors.New("invalid range")

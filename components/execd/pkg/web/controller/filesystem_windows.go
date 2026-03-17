@@ -31,15 +31,34 @@ import (
 	"github.com/alibaba/opensandbox/execd/pkg/web/model"
 )
 
-// FilesystemController handles file system operations.
+// FilesystemController 文件系统控制器
+//
+// FilesystemController 处理文件系统相关的 API 请求，
+// 提供文件查询、上传、下载、删除、重命名等功能。
 type FilesystemController struct {
+	// basicController 基础控制器嵌入
 	*basicController
 }
 
+// NewFilesystemController 创建文件系统控制器实例
+//
+// 参数:
+//   - ctx: Gin 上下文
+//
+// 返回值:
+//   - *FilesystemController: 新创建的控制器实例
 func NewFilesystemController(ctx *gin.Context) *FilesystemController {
 	return &FilesystemController{basicController: newBasicController(ctx)}
 }
 
+// handleFileError 处理文件操作错误
+//
+// 本方法根据错误类型返回相应的 HTTP 响应：
+//   - 文件不存在：返回 404 Not Found
+//   - 其他错误：返回 500 Internal Server Error
+//
+// 参数:
+//   - err: 文件操作错误
 func (c *FilesystemController) handleFileError(err error) {
 	if os.IsNotExist(err) {
 		c.RespondError(
@@ -56,7 +75,10 @@ func (c *FilesystemController) handleFileError(err error) {
 	}
 }
 
-// GetFilesInfo retrieves metadata for specified file paths
+// GetFilesInfo 获取多个文件的元数据
+//
+// 本接口根据查询参数 path 获取指定文件的详细信息，
+// 包括大小、修改时间、创建时间和权限。
 func (c *FilesystemController) GetFilesInfo() {
 	paths := c.ctx.QueryArray("path")
 	if len(paths) == 0 {
@@ -77,7 +99,10 @@ func (c *FilesystemController) GetFilesInfo() {
 	c.RespondSuccess(resp)
 }
 
-// RemoveFiles deletes specified files
+// RemoveFiles 删除多个文件
+//
+// 本接口根据查询参数 path 删除指定的文件。
+// 文件不存在时不返回错误。
 func (c *FilesystemController) RemoveFiles() {
 	paths := c.ctx.QueryArray("path")
 	for _, filePath := range paths {
@@ -94,7 +119,10 @@ func (c *FilesystemController) RemoveFiles() {
 	c.RespondSuccess(nil)
 }
 
-// ChmodFiles changes file permissions for specified files
+// ChmodFiles 修改多个文件的权限
+//
+// 本接口根据请求体中的文件路径和权限设置，
+// 批量修改文件的权限模式。
 func (c *FilesystemController) ChmodFiles() {
 	var request map[string]model.Permission
 	if err := c.bindJSON(&request); err != nil {
@@ -121,7 +149,10 @@ func (c *FilesystemController) ChmodFiles() {
 	c.RespondSuccess(nil)
 }
 
-// RenameFiles renames or moves files to new paths
+// RenameFiles 重命名或移动多个文件
+//
+// 本接口根据请求体中的源路径和目标路径，
+// 批量重命名或移动文件。
 func (c *FilesystemController) RenameFiles() {
 	var request []model.RenameFileItem
 	if err := c.bindJSON(&request); err != nil {
@@ -143,7 +174,10 @@ func (c *FilesystemController) RenameFiles() {
 	c.RespondSuccess(nil)
 }
 
-// MakeDirs creates directories with specified permissions
+// MakeDirs 创建多个目录
+//
+// 本接口根据请求体中的目录路径和权限设置，
+// 批量创建目录（包括父目录）。
 func (c *FilesystemController) MakeDirs() {
 	var request map[string]model.Permission
 	if err := c.bindJSON(&request); err != nil {
@@ -165,7 +199,9 @@ func (c *FilesystemController) MakeDirs() {
 	c.RespondSuccess(nil)
 }
 
-// RemoveDirs recursively removes directories
+// RemoveDirs 递归删除多个目录
+//
+// 本接口根据查询参数 path 删除指定的目录及其内容。
 func (c *FilesystemController) RemoveDirs() {
 	paths := c.ctx.QueryArray("path")
 	for _, dir := range paths {
@@ -182,7 +218,14 @@ func (c *FilesystemController) RemoveDirs() {
 	c.RespondSuccess(nil)
 }
 
-// SearchFiles searches for files matching a pattern in a directory
+// SearchFiles 搜索匹配模式的文件
+//
+// 本接口在指定目录下搜索匹配 glob 模式的文件，
+// 返回匹配文件的详细信息列表。
+//
+// 查询参数：
+//   - path: 搜索起始目录
+//   - pattern: glob 模式（可选，默认为 "**"）
 func (c *FilesystemController) SearchFiles() {
 	path := c.ctx.Query("path")
 	if path == "" {
@@ -265,7 +308,10 @@ func (c *FilesystemController) SearchFiles() {
 	c.RespondSuccess(files)
 }
 
-// ReplaceContent replaces text content in specified files
+// ReplaceContent 替换文件中的文本内容
+//
+// 本接口根据请求体中的文件路径和替换内容，
+// 批量替换文件中的指定文本。
 func (c *FilesystemController) ReplaceContent() {
 	var request map[string]model.ReplaceFileContentItem
 	if err := c.bindJSON(&request); err != nil {

@@ -13,10 +13,44 @@
 # limitations under the License.
 
 """
-Docker-based implementation of SandboxService.
+基于 Docker 的沙箱服务实现。
 
-This module provides a Docker implementation of the sandbox service interface,
-using Docker containers for sandbox lifecycle management.
+本模块提供 SandboxService 接口的 Docker 实现，使用 Docker 容器进行沙箱生命周期管理。
+
+主要功能：
+1. 沙箱创建：从容器镜像创建沙箱，配置资源限制、环境变量、存储挂载等
+2. 沙箱查询：获取沙箱状态和信息
+3. 沙箱列表：支持过滤和分页的沙箱列表查询
+4. 沙箱删除：终止并删除沙箱容器
+5. 沙箱暂停/恢复：暂停和恢复沙箱执行
+6. 过期管理：自动过期沙箱的定时清理
+7. 端点解析：获取沙箱服务的访问端点
+8. 网络策略：支持出站网络控制的 sidecar 代理
+9. 存储挂载：支持主机路径、PVC、OSSFS 等多种存储后端
+
+架构设计：
+- 继承自 SandboxService 抽象类，实现所有抽象方法
+- 使用 OSSFSMixin 提供 OSSFS 挂载支持
+- 使用 SecureRuntimeResolver 解析安全运行时配置（gVisor、Kata 等）
+- 使用 Timer 实现沙箱自动过期清理
+- 使用锁机制保证并发安全
+
+沙箱创建流程：
+1. 验证请求参数（入口点、元数据、超时时间、网络策略、卷等）
+2. 生成沙箱 ID 和过期时间
+3. 准备 OSSFS 挂载
+4. 构建卷绑定挂载
+5. 配置网络策略（如果需要，启动 egress sidecar）
+6. 创建并启动容器
+7. 复制 execd 工具和 bootstrap 脚本到容器
+8. 设置过期定时器
+9. 返回沙箱信息
+
+并发安全：
+- _expiration_lock: 保护过期定时器操作
+- _execd_archive_lock: 保护 execd 归档缓存
+- _pending_lock: 保护待处理沙箱操作
+- _ossfs_mount_lock: 保护 OSSFS 挂载引用计数
 """
 
 from __future__ import annotations
@@ -91,25 +125,57 @@ logger = logging.getLogger(__name__)
 
 
 def _running_inside_docker_container() -> bool:
-    """Return True if the current process is running inside a Docker container."""
+    """
+    判断当前进程是否运行在 Docker 容器内。
+
+    通过检查 /.dockerenv 文件是否存在来判断。
+    Docker 会在容器内创建这个文件作为标记。
+
+    Returns:
+        bool: 如果当前进程运行在 Docker 容器内返回 True，否则返回 False
+    """
     return os.path.exists("/.dockerenv")
 
 
+# OpenSandbox 目录路径
+# 这是容器内安装 execd 工具和 bootstrap 脚本的目录
 OPENSANDBOX_DIR = "/opt/opensandbox"
-# Use posixpath for container-internal paths so they always use forward slashes,
-# even when the server runs on Windows.
+# 使用 posixpath 用于容器内部路径，这样即使在 Windows 上运行服务器
+# 也能保证路径始终使用正斜杠 (/)
 EXECED_INSTALL_PATH = posixpath.join(OPENSANDBOX_DIR, "execd")
 BOOTSTRAP_PATH = posixpath.join(OPENSANDBOX_DIR, "bootstrap.sh")
 
-HOST_NETWORK_MODE = "host"
-BRIDGE_NETWORK_MODE = "bridge"
+# Docker 网络模式常量
+HOST_NETWORK_MODE = "host"          # 主机网络模式：容器与主机共享网络栈
+BRIDGE_NETWORK_MODE = "bridge"      # 桥接网络模式：容器使用 Docker 网桥
+
+# 待处理沙箱的失败 TTL（秒），默认 3600 秒（1 小时）
+# 沙箱在待处理状态失败后，会保留这么长时间以便调试
 PENDING_FAILURE_TTL_SECONDS = int(os.environ.get("PENDING_FAILURE_TTL", "3600"))
+
+# 环境变量名：出站规则
+# 用于将网络策略规则传递给 egress sidecar 容器
 EGRESS_RULES_ENV = "OPENSANDBOX_EGRESS_RULES"
+
+# 容器标签：egress sidecar 标记
+# 标记 egress sidecar 容器，指示它是为哪个沙箱 ID 服务的
 EGRESS_SIDECAR_LABEL = "opensandbox.io/egress-sidecar-for"
 
 
 @dataclass
 class PendingSandbox:
+    """
+    待处理的沙箱数据结构。
+
+    用于在沙箱异步配置期间跟踪沙箱状态。
+    当沙箱创建请求被接受但容器尚未完全启动时，沙箱处于 Pending 状态。
+
+    Attributes:
+        request: 沙箱创建请求
+        created_at: 创建时间戳
+        expires_at: 过期时间戳（如果设置了超时）
+        status: 当前状态信息
+    """
     request: CreateSandboxRequest
     created_at: datetime
     expires_at: Optional[datetime]
@@ -118,69 +184,111 @@ class PendingSandbox:
 
 class DockerSandboxService(OSSFSMixin, SandboxService):
     """
-    Docker-based implementation of SandboxService.
+    基于 Docker 的沙箱服务实现。
 
-    This class implements sandbox lifecycle operations using Docker containers.
+    此类使用 Docker 容器实现沙箱生命周期操作。
+
+    继承关系：
+    - OSSFSMixin: 提供 OSSFS 挂载支持
+    - SandboxService: 沙箱服务抽象接口
+
+    主要组件：
+    - docker_client: Docker 客户端，用于容器操作
+    - app_config: 应用配置
+    - execd_image: execd 工具镜像名称
+    - network_mode: Docker 网络模式（host/bridge/自定义网络）
+    - _sandbox_expirations: 沙箱过期时间字典
+    - _expiration_timers: 沙箱过期定时器字典
+    - _pending_sandboxes: 待处理沙箱字典
+    - _ossfs_mount_ref_counts: OSSFS 挂载引用计数字典
+
+    线程安全：
+    - _expiration_lock: 保护过期时间操作
+    - _execd_archive_lock: 保护 execd 归档缓存
+    - _pending_lock: 保护待处理沙箱操作
+    - _ossfs_mount_lock: 保护 OSSFS 挂载引用计数
     """
 
     def __init__(self, config: Optional[AppConfig] = None):
         """
-        Initialize Docker sandbox service.
+        初始化 Docker 沙箱服务。
 
-        Initializes Docker service from environment variables.
-        The service will read configuration from:
-        - DOCKER_HOST: Docker daemon URL (e.g., 'unix://var/run/docker.sock' or 'tcp://127.0.0.1:2376')
-        - DOCKER_TLS_CERTDIR: Directory containing TLS certificates
-        - Other Docker environment variables as needed
+        从环境变量初始化 Docker 服务。
+        服务会读取以下配置：
+        - DOCKER_HOST: Docker 守护进程 URL（如 'unix://var/run/docker.sock' 或 'tcp://127.0.0.1:2376'）
+        - DOCKER_TLS_CERTDIR: 包含 TLS 证书的目录
+        - 其他 Docker 环境变量（如需要）
 
-        Note: Connection is not verified at initialization time.
-        Connection errors will be raised when Docker operations are performed.
+        初始化流程：
+        1. 验证配置中的 runtime.type 为 'docker'
+        2. 解析 execd 镜像和网络模式配置
+        3. 创建 Docker 客户端，设置超时时间
+        4. 初始化各种数据结构和锁
+        5. 恢复现有沙箱的过期定时器
+        6. 初始化安全运行时解析器
+
+        注意：初始化时不会验证连接。
+        连接错误会在执行 Docker 操作时抛出。
+
+        Args:
+            config: 应用配置，如果未提供则使用全局配置
+
+        Raises:
+            ValueError: 如果 runtime.type 不是 'docker'
+            HTTPException: 如果 Docker 服务初始化失败
         """
+        # 保存应用配置
         self.app_config = config or get_config()
         runtime_config = self.app_config.runtime
+        # 验证运行时类型
         if runtime_config.type != "docker":
-            raise ValueError("DockerSandboxService requires runtime.type = 'docker'.")
+            raise ValueError("DockerSandboxService 要求 runtime.type = 'docker'。")
 
+        # execd 工具镜像名称，用于沙箱初始化
         self.execd_image = runtime_config.execd_image
+        # Docker 网络模式，默认使用 host 模式
         self.network_mode = (self.app_config.docker.network_mode or HOST_NETWORK_MODE).lower()
+        # execd 归档缓存，用于加速沙箱创建
         self._execd_archive_cache: Optional[bytes] = None
+        # 解析 Docker API 超时时间
         self._api_timeout = self._resolve_api_timeout()
         try:
-            # Initialize Docker service from environment variables
+            # 从环境变量初始化 Docker 服务
             client_kwargs = {}
             try:
+                # 检查 docker.from_env 是否支持 timeout 参数
                 signature = inspect.signature(docker.from_env)
                 if "timeout" in signature.parameters:
                     client_kwargs["timeout"] = self._api_timeout
             except (ValueError, TypeError):
                 logger.debug(
-                    "Unable to introspect docker.from_env signature; using default parameters."
+                    "无法检查 docker.from_env 签名；使用默认参数。"
                 )
             self.docker_client = docker.from_env(**client_kwargs)
             if not client_kwargs:
                 try:
                     self.docker_client.api.timeout = self._api_timeout
                 except AttributeError:
-                    logger.debug("Docker client API does not expose timeout attribute.")
-            logger.info("Docker service initialized from environment")
+                    logger.debug("Docker 客户端 API 不暴露 timeout 属性。")
+            logger.info("Docker 服务已从环境变量初始化")
         except Exception as e:  # noqa: BLE001
-            # Common failure mode on macOS/dev machines: Docker daemon not running or socket path wrong.
+            # macOS/开发机器上的常见失败模式：Docker 守护进程未运行或 socket 路径错误
             hint = ""
             msg = str(e)
             if isinstance(e, FileNotFoundError) or "No such file or directory" in msg:
                 docker_host = os.environ.get("DOCKER_HOST", "")
                 hint = (
-                    " Docker daemon seems unavailable (unix socket not found). "
-                    "Make sure Docker Desktop (or Colima/Rancher Desktop) is running. "
-                    "If you use Colima on macOS, you may need to set "
-                    "DOCKER_HOST=unix://${HOME}/.colima/default/docker.sock before starting the server. "
-                    f"(current DOCKER_HOST='{docker_host}')"
+                    " Docker 守护进程似乎不可用（未找到 unix socket）。"
+                    "确保 Docker Desktop（或 Colima/Rancher Desktop）正在运行。"
+                    "如果在 macOS 上使用 Colima，可能需要在启动服务器之前设置 "
+                    "DOCKER_HOST=unix://${HOME}/.colima/default/docker.sock。"
+                    f"(当前 DOCKER_HOST='{docker_host}')"
                 )
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail={
                     "code": SandboxErrorCodes.DOCKER_INITIALIZATION_ERROR,
-                    "message": f"Failed to initialize Docker service: {str(e)}.{hint}",
+                    "message": f"初始化 Docker 服务失败：{str(e)}.{hint}",
                 },
             )
         self._expiration_lock = Lock()

@@ -13,10 +13,28 @@
 # limitations under the License.
 
 """
-Egress sidecar helper functions for Kubernetes workloads.
+Kubernetes 工作负载的 Egress 侧车容器辅助函数模块。
 
-This module provides shared utilities for building egress sidecar containers
-and related configurations that can be reused across different workload providers.
+本模块提供了用于构建 Egress 侧车容器和相关配置的共享工具函数，
+可被不同的工作负载提供者（WorkloadProvider）复用。
+
+Egress 侧车用于：
+- 实现网络策略（NetworkPolicy）
+- 控制沙箱容器的出站流量
+- 通过 iptables 规则限制访问目标
+
+当提供 network_policy 时，会自动添加 egress 侧车容器到 Pod 中。
+侧车容器需要 NET_ADMIN 权限来管理 iptables 规则。
+
+使用示例：
+    >>> pod_spec = {"containers": [main_container], "volumes": [...]}
+    >>> containers = [main_container_dict]
+    >>> apply_egress_to_spec(
+    ...     pod_spec=pod_spec,
+    ...     containers=containers,
+    ...     network_policy=network_policy,
+    ...     egress_image="opensandbox/egress:v1.0.3"
+    ... )
 """
 
 import json
@@ -24,7 +42,7 @@ from typing import Dict, Any, List, Optional
 
 from src.api.schema import NetworkPolicy
 
-# Environment variable name for passing network policy to egress sidecar
+# 传递给 egress 侧车的网络策略环境变量名
 EGRESS_RULES_ENV = "OPENSANDBOX_EGRESS_RULES"
 
 
@@ -33,56 +51,54 @@ def build_egress_sidecar_container(
     network_policy: NetworkPolicy,
 ) -> Dict[str, Any]:
     """
-    Build egress sidecar container specification for Kubernetes Pod.
-    
-    This function creates a container spec that can be added to a Pod's containers
-    list. The sidecar container will:
-    - Run the egress image
-    - Receive network policy via OPENSANDBOX_EGRESS_RULES environment variable
-    - Have NET_ADMIN capability to manage iptables
-    
-    Note: In Kubernetes, containers in the same Pod share the network namespace,
-    so the main container can access the sidecar's ports (44772 for execd, 8080 for HTTP)
-    via localhost without explicit port declarations.
-    
-    Important: IPv6 should be disabled at the Pod level (not container level) using
-    build_ipv6_disable_sysctls() and adding the result to Pod's securityContext.sysctls.
-    
+    为 Kubernetes Pod 构建 egress 侧车容器规格。
+
+    本函数创建一个容器规格，可以添加到 Pod 的 containers 列表中。
+    侧车容器将：
+    - 运行 egress 镜像
+    - 通过 OPENSANDBOX_EGRESS_RULES 环境变量接收网络策略
+    - 具有 NET_ADMIN 权限以管理 iptables
+
+    注意：在 Kubernetes 中，同一 Pod 中的容器共享网络命名空间，
+    因此主容器可以通过 localhost 访问侧车的端口（44772 用于 execd，8080 用于 HTTP），
+    无需显式声明端口。
+
+    重要：IPv6 应该在 Pod 级别（而非容器级别）使用 build_ipv6_disable_sysctls()
+    禁用，并将结果添加到 Pod 的 securityContext.sysctls 中。
+
     Args:
-        egress_image: Container image for the egress sidecar
-        network_policy: Network policy configuration to enforce
-        
+        egress_image: Egress 侧车的容器镜像
+        network_policy: 要执行的网络策略配置
+
     Returns:
-        Dict containing container specification compatible with Kubernetes Pod spec.
-        This dict can be directly added to the Pod's containers list.
-        
-    Example:
-        ```python
-        sidecar = build_egress_sidecar_container(
-            egress_image="opensandbox/egress:v1.0.3",
-            network_policy=NetworkPolicy(
-                default_action="deny",
-                egress=[NetworkRule(action="allow", target="pypi.org")]
-            )
-        )
-        pod_spec["containers"].append(sidecar)
-        
-        # Disable IPv6 at Pod level (extends existing sysctls)
-        if "securityContext" not in pod_spec:
-            pod_spec["securityContext"] = {}
-        existing_sysctls = pod_spec["securityContext"].get("sysctls")
-        new_sysctls = build_ipv6_disable_sysctls()
-        pod_spec["securityContext"]["sysctls"] = _merge_sysctls(
-            existing_sysctls, new_sysctls
-        )
-        ```
+        Dict: 包含与 Kubernetes Pod 规格兼容的容器规格
+              该字典可以直接添加到 Pod 的 containers 列表中
+
+    Examples:
+        >>> sidecar = build_egress_sidecar_container(
+        ...     egress_image="opensandbox/egress:v1.0.3",
+        ...     network_policy=NetworkPolicy(
+        ...         default_action="deny",
+        ...         egress=[NetworkRule(action="allow", target="pypi.org")]
+        ...     )
+        ... )
+        >>> pod_spec["containers"].append(sidecar)
+        >>>
+        >>> # 在 Pod 级别禁用 IPv6（扩展现有 sysctls）
+        >>> if "securityContext" not in pod_spec:
+        ...     pod_spec["securityContext"] = {}
+        >>> existing_sysctls = pod_spec["securityContext"].get("sysctls")
+        >>> new_sysctls = build_ipv6_disable_sysctls()
+        >>> pod_spec["securityContext"]["sysctls"] = _merge_sysctls(
+        ...     existing_sysctls, new_sysctls
+        ... )
     """
-    # Serialize network policy to JSON for environment variable
+    # 将网络策略序列化为 JSON，用于环境变量
     policy_payload = json.dumps(
         network_policy.model_dump(by_alias=True, exclude_none=True)
     )
-    
-    # Build container specification
+
+    # 构建容器规格
     container_spec: Dict[str, Any] = {
         "name": "egress",
         "image": egress_image,
@@ -94,25 +110,25 @@ def build_egress_sidecar_container(
         ],
         "securityContext": _build_security_context_for_egress(),
     }
-    
+
     return container_spec
 
 
 def _build_security_context_for_egress() -> Dict[str, Any]:
     """
-    Build security context for egress sidecar container.
-    
-    The egress sidecar needs NET_ADMIN capability to manage iptables rules
-    for network policy enforcement.
-    
-    This is an internal helper function used by build_egress_sidecar_container().
-    
+    为 egress 侧车容器构建安全上下文。
+
+    Egress 侧车需要 NET_ADMIN 权限来管理 iptables 规则，
+    以执行网络策略。
+
+    这是 build_egress_sidecar_container() 使用的内部辅助函数。
+
     Returns:
-        Dict containing security context configuration with NET_ADMIN capability.
+        Dict: 包含 NET_ADMIN 权限的安全上下文配置
     """
     return {
         "capabilities": {
-            "add": ["NET_ADMIN"],
+            "add": ["NET_ADMIN"],  # 添加 NET_ADMIN 权限
         },
     }
 
@@ -121,25 +137,24 @@ def build_security_context_for_sandbox_container(
     has_network_policy: bool,
 ) -> Dict[str, Any]:
     """
-    Build security context for main sandbox container.
-    
-    When network policy is enabled, the main container should drop NET_ADMIN
-    capability to prevent it from modifying network configuration. Only the
-    egress sidecar should have NET_ADMIN.
-    
+    为主沙箱容器构建安全上下文。
+
+    当启用网络策略时，主容器应该丢弃 NET_ADMIN 权限，
+    以防止其修改网络配置。只有 egress 侧车应该具有 NET_ADMIN。
+
     Args:
-        has_network_policy: Whether network policy is enabled for this sandbox
-        
+        has_network_policy: 此 sandbox 是否启用了网络策略
+
     Returns:
-        Dict containing security context configuration. If has_network_policy is True,
-        includes NET_ADMIN in the drop list. Otherwise, returns empty dict.
+        Dict: 安全上下文配置。如果 has_network_policy 为 True，
+              包含 NET_ADMIN 在 drop 列表中；否则返回空字典
     """
     if not has_network_policy:
         return {}
-    
+
     return {
         "capabilities": {
-            "drop": ["NET_ADMIN"],
+            "drop": ["NET_ADMIN"],  # 丢弃 NET_ADMIN 权限
         },
     }
 
@@ -149,35 +164,39 @@ def _merge_sysctls(
     new_sysctls: List[Dict[str, str]],
 ) -> List[Dict[str, str]]:
     """
-    Merge new sysctls into existing sysctls, avoiding duplicates.
-    
-    If a sysctl with the same name already exists, the new value will
-    override the existing one (last write wins).
-    
+    将新的 sysctls 合并到现有的 sysctls 中，避免重复。
+
+    如果已存在同名的 sysctl，新值将覆盖现有值（最后写入优先）。
+
     Args:
-        existing_sysctls: Existing sysctls list or None
-        new_sysctls: New sysctls to merge in
-        
+        existing_sysctls: 现有的 sysctls 列表或 None
+        new_sysctls: 要合并的新 sysctls
+
     Returns:
-        Merged list of sysctls with no duplicate names
+        List[Dict[str, str]]: 合并后的 sysctls 列表，无重复名称
+
+    Examples:
+        >>> existing = [{"name": "net.ipv4.ip_forward", "value": "0"}]
+        >>> new = build_ipv6_disable_sysctls()
+        >>> merged = _merge_sysctls(existing, new)
     """
     if not existing_sysctls:
         return new_sysctls.copy()
-    
-    # Create a dict to track sysctls by name (for deduplication)
+
+    # 创建字典以按名称跟踪 sysctls（用于去重）
     sysctls_dict: Dict[str, str] = {}
-    
-    # First, add existing sysctls
+
+    # 首先添加现有的 sysctls
     for sysctl in existing_sysctls:
         if isinstance(sysctl, dict) and "name" in sysctl:
             sysctls_dict[sysctl["name"]] = sysctl.get("value", "")
-    
-    # Then, add/override with new sysctls
+
+    # 然后添加/覆盖新的 sysctls
     for sysctl in new_sysctls:
         if isinstance(sysctl, dict) and "name" in sysctl:
             sysctls_dict[sysctl["name"]] = sysctl.get("value", "")
-    
-    # Convert back to list format
+
+    # 转换回列表格式
     return [{"name": name, "value": value} for name, value in sysctls_dict.items()]
 
 
@@ -188,50 +207,47 @@ def apply_egress_to_spec(
     egress_image: Optional[str],
 ) -> None:
     """
-    Apply egress sidecar configuration to Pod spec.
-    
-    This function adds the egress sidecar container to the containers list
-    and configures IPv6 disable sysctls at the Pod level when network policy
-    is provided. Existing sysctls are preserved and merged with the new ones.
-    
+    将 egress 侧车配置应用到 Pod 规格。
+
+    本函数将 egress 侧车容器添加到 containers 列表中，
+    并在提供网络策略时在 Pod 级别配置 IPv6 禁用 sysctls。
+    现有的 sysctls 会被保留并与新的 sysctls 合并。
+
     Args:
-        pod_spec: Pod specification dict (will be modified in place)
-        containers: List of container dicts (will be modified in place)
-        network_policy: Optional network policy configuration
-        egress_image: Optional egress sidecar image
-        
-    Example:
-        ```python
-        containers = [main_container_dict]
-        pod_spec = {"containers": containers, ...}
-        
-        apply_egress_to_spec(
-            pod_spec=pod_spec,
-            containers=containers,
-            network_policy=network_policy,
-            egress_image=egress_image,
-        )
-        ```
-        
-    Note:
-        This function extends existing sysctls rather than overwriting them.
-        If a sysctl with the same name already exists, the egress-related
-        sysctls will override it (last write wins).
+        pod_spec: Pod 规格字典（原地修改）
+        containers: 容器字典列表（原地修改）
+        network_policy: 可选的网络策略配置
+        egress_image: 可选的 egress 侧车镜像
+
+    Examples:
+        >>> containers = [main_container_dict]
+        >>> pod_spec = {"containers": containers, ...}
+        >>>
+        >>> apply_egress_to_spec(
+        ...     pod_spec=pod_spec,
+        ...     containers=containers,
+        ...     network_policy=network_policy,
+        ...     egress_image=egress_image,
+        ... )
+
+    注意:
+        本函数扩展现有的 sysctls 而不是覆盖它们。
+        如果已存在同名的 sysctl，egress 相关的 sysctls 将覆盖它（最后写入优先）。
     """
     if not network_policy or not egress_image:
         return
-    
-    # Build and add egress sidecar container
+
+    # 构建并添加 egress 侧车容器
     sidecar_container = build_egress_sidecar_container(
         egress_image=egress_image,
         network_policy=network_policy,
     )
     containers.append(sidecar_container)
-    
-    # Disable IPv6 at Pod level, merging with existing sysctls
+
+    # 在 Pod 级别禁用 IPv6，与现有的 sysctls 合并
     if "securityContext" not in pod_spec:
         pod_spec["securityContext"] = {}
-    
+
     existing_sysctls = pod_spec["securityContext"].get("sysctls")
     new_sysctls = build_ipv6_disable_sysctls()
     pod_spec["securityContext"]["sysctls"] = _merge_sysctls(
@@ -243,36 +259,34 @@ def build_security_context_from_dict(
     security_context_dict: Dict[str, Any],
 ) -> Optional[Any]:
     """
-    Convert security context dict to V1SecurityContext object.
-    
-    This is a helper function to convert the dict returned by
-    build_security_context_for_sandbox_container() into a Kubernetes
-    V1SecurityContext object that can be used in V1Container.
-    
+    将安全上下文字典转换为 V1SecurityContext 对象。
+
+    这是辅助函数，用于将 build_security_context_for_sandbox_container()
+    返回的字典转换为 Kubernetes V1SecurityContext 对象，
+    可以在 V1Container 中使用。
+
     Args:
-        security_context_dict: Security context configuration dict
-        
+        security_context_dict: 安全上下文配置字典
+
     Returns:
-        V1SecurityContext object or None if dict is empty
-        
-    Example:
-        ```python
-        from kubernetes.client import V1Container
-        
-        security_context_dict = build_security_context_for_sandbox_container(True)
-        security_context = build_security_context_from_dict(security_context_dict)
-        
-        container = V1Container(
-            name="sandbox",
-            security_context=security_context,
-        )
-        ```
+        V1SecurityContext: Kubernetes 安全上下文对象，如果字典为空则返回 None
+
+    Examples:
+        >>> from kubernetes.client import V1Container
+        >>>
+        >>> security_context_dict = build_security_context_for_sandbox_container(True)
+        >>> security_context = build_security_context_from_dict(security_context_dict)
+        >>>
+        >>> container = V1Container(
+        ...     name="sandbox",
+        ...     security_context=security_context,
+        ... )
     """
     if not security_context_dict:
         return None
-    
+
     from kubernetes.client import V1SecurityContext, V1Capabilities
-    
+
     capabilities = None
     if "capabilities" in security_context_dict:
         caps_dict = security_context_dict["capabilities"]
@@ -282,7 +296,7 @@ def build_security_context_from_dict(
             add=add_caps if add_caps else None,
             drop=drop_caps if drop_caps else None,
         )
-    
+
     return V1SecurityContext(capabilities=capabilities)
 
 
@@ -290,35 +304,33 @@ def serialize_security_context_to_dict(
     security_context: Optional[Any],
 ) -> Optional[Dict[str, Any]]:
     """
-    Serialize V1SecurityContext to dict format for CRD.
-    
-    This function converts a V1SecurityContext object (from V1Container)
-    into a dict format that can be used in Kubernetes CRD specifications.
-    
+    将 V1SecurityContext 序列化为字典格式（用于 CRD）。
+
+    本函数将 V1SecurityContext 对象（来自 V1Container）
+    转换为字典格式，可用于 Kubernetes CRD 规格中。
+
     Args:
-        security_context: V1SecurityContext object or None
-        
+        security_context: V1SecurityContext 对象或 None
+
     Returns:
-        Dict representation of security context or None
-        
-    Example:
-        ```python
-        container_dict = {
-            "name": container.name,
-            "image": container.image,
-        }
-        
-        if container.security_context:
-            container_dict["securityContext"] = serialize_security_context_to_dict(
-                container.security_context
-            )
-        ```
+        Dict[str, Any]: 安全上下文的字典表示或 None
+
+    Examples:
+        >>> container_dict = {
+        ...     "name": container.name,
+        ...     "image": container.image,
+        ... }
+        >>>
+        >>> if container.security_context:
+        ...     container_dict["securityContext"] = serialize_security_context_to_dict(
+        ...         container.security_context
+        ...     )
     """
     if not security_context:
         return None
-    
+
     result: Dict[str, Any] = {}
-    
+
     if security_context.capabilities:
         caps: Dict[str, Any] = {}
         if security_context.capabilities.add:
@@ -327,25 +339,30 @@ def serialize_security_context_to_dict(
             caps["drop"] = security_context.capabilities.drop
         if caps:
             result["capabilities"] = caps
-    
+
     return result if result else None
 
 
 def build_ipv6_disable_sysctls() -> list[Dict[str, str]]:
     """
-    Build sysctls configuration to disable IPv6 in the Pod.
-    
-    When egress sidecar is used, IPv6 should be disabled in the shared network
-    namespace to keep policy enforcement consistent. This matches the Docker
-    implementation behavior.
-    
+    构建禁用 Pod 中 IPv6 的 sysctls 配置。
+
+    当使用 egress 侧车时，应该在共享的网络命名空间中禁用 IPv6，
+    以保持策略执行的一致性。这与 Docker 实现的行为相匹配。
+
     Returns:
-        List of sysctl configurations to disable IPv6 at Pod level.
-        
-    Note:
-        These sysctls need to be set at the Pod's securityContext level, not
-        at the container level. The calling code should merge this into the
-        Pod spec's securityContext.sysctls field.
+        List[Dict[str, str]]: 在 Pod 级别禁用 IPv6 的 sysctl 配置列表
+
+    注意:
+        这些 sysctls 需要在 Pod 的 securityContext 级别设置，而不是
+        容器级别。调用代码应该将此合并到 Pod 规格的 securityContext.sysctls 字段中。
+
+    示例返回：
+        [
+            {"name": "net.ipv6.conf.all.disable_ipv6", "value": "1"},
+            {"name": "net.ipv6.conf.default.disable_ipv6", "value": "1"},
+            {"name": "net.ipv6.conf.lo.disable_ipv6", "value": "1"}
+        ]
     """
     return [
         {"name": "net.ipv6.conf.all.disable_ipv6", "value": "1"},

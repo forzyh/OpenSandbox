@@ -12,9 +12,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-try:
-    from importlib.metadata import version
+"""OpenSandbox CLI 工具包入口模块。
 
-    __version__ = version("opensandbox-cli")
-except Exception:
-    __version__ = "0.0.0-dev"
+本模块是 opensandbox_cli 包的入口点，主要功能包括：
+1. 导入主 CLI 入口函数 cli
+2. 支持通过 `python -m opensandbox_cli` 方式运行 CLI 工具
+
+使用示例：
+    # 直接运行
+    from opensandbox_cli import cli
+    cli()
+
+    # 或通过模块方式运行
+    python -m opensandbox_cli --help
+"""
+
+from opensandbox_cli.main import cli
+
+if __name__ == "__main__":
+    cli()

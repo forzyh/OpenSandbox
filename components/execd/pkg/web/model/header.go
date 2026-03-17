@@ -15,6 +15,9 @@
 package model
 
 const (
-	// ApiAccessTokenHeader carries the auth token.
+	// ApiAccessTokenHeader 访问令牌请求头键名
+	//
+	// 此请求头用于在 API 请求中携带访问令牌进行认证。
+	// 客户端需要在请求头中设置此字段，值为服务器配置的访问令牌。
 	ApiAccessTokenHeader = "X-EXECD-ACCESS-TOKEN"
 )

@@ -22,6 +22,15 @@ import (
 	"time"
 )
 
+// getFileCreateTime 获取文件的创建时间（非 Linux 版本）
+//
+// 在非 Linux 系统上，返回当前时间作为占位符。
+//
+// 参数:
+//   - _ os.FileInfo: 文件信息（未使用）
+//
+// 返回值:
+//   - time.Time: 当前时间
 func getFileCreateTime(_ os.FileInfo) time.Time {
 	return time.Now()
 }

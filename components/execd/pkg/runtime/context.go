@@ -15,31 +15,117 @@
 package runtime
 
 import (
-	"errors"
+	"context"
+	"database/sql"
 	"fmt"
 	"net/http"
-	"os"
-	"path/filepath"
-	"strings"
+	"sync"
+	"time"
 
-	"github.com/google/uuid"
-	"k8s.io/client-go/util/retry"
+	"k8s.io/apimachinery/pkg/util/wait"
 
 	"github.com/alibaba/opensandbox/execd/pkg/jupyter"
 	jupytersession "github.com/alibaba/opensandbox/execd/pkg/jupyter/session"
 	"github.com/alibaba/opensandbox/execd/pkg/log"
 )
 
-// CreateContext provisions a kernel-backed session and returns its ID.
-// Bash language uses Jupyter kernel like other languages; for pipe-based bash sessions use CreateBashSession (session API).
+var kernelWaitingBackoff = wait.Backoff{
+	Steps:    60,
+	Duration: 500 * time.Millisecond,
+	Factor:   1.5,
+	Jitter:   0.1,
+}
+
+// Controller 运行时控制器，管理多种代码执行后端
+// 详细说明请参考 ctrl.go 文件
+type Controller struct {
+	baseURL                 string
+	token                   string
+	mu                      sync.RWMutex
+	jupyterClientMap        sync.Map // map[sessionID]*jupyterKernel
+	defaultLanguageSessions sync.Map // map[Language]string
+	commandClientMap        sync.Map // map[sessionID]*commandKernel
+	bashSessionClientMap    sync.Map // map[sessionID]*bashSession
+	db                      *sql.DB
+	dbOnce                  sync.Once
+}
+
+type jupyterKernel struct {
+	mu       sync.Mutex
+	kernelID string
+	client   *jupyter.Client
+	language Language
+}
+
+type commandKernel struct {
+	pid          int
+	stdoutPath   string
+	stderrPath   string
+	startedAt    time.Time
+	finishedAt   *time.Time
+	exitCode     *int
+	errMsg       string
+	running      bool
+	isBackground bool
+	content      string
+}
+
+// NewController 创建运行时控制器
+func NewController(baseURL, token string) *Controller {
+	return &Controller{
+		baseURL: baseURL,
+		token:   token,
+	}
+}
+
+// Execute 分发执行请求到相应后端
+func (c *Controller) Execute(request *ExecuteCodeRequest) error {
+	var cancel context.CancelFunc
+	var ctx context.Context
+	if request.Timeout > 0 {
+		ctx, cancel = context.WithTimeout(context.Background(), request.Timeout)
+	} else {
+		ctx, cancel = context.WithCancel(context.Background())
+	}
+
+	switch request.Language {
+	case Command:
+		defer cancel()
+		return c.runCommand(ctx, request)
+	case BackgroundCommand:
+		return c.runBackgroundCommand(ctx, cancel, request)
+	case Bash, Python, Java, JavaScript, TypeScript, Go:
+		defer cancel()
+		return c.runJupyter(ctx, request)
+	case SQL:
+		defer cancel()
+		return c.runSQL(ctx, request)
+	default:
+		defer cancel()
+		return fmt.Errorf("unknown language: %s", request.Language)
+	}
+}
+
+// CreateContext 创建内核支持的会话并返回会话 ID
+//
+// 本方法为指定语言创建一个新的 Jupyter 会话上下文。
+// Bash 语言使用 Jupyter 内核像其他语言一样执行；
+// 如需基于管道的 Bash 会话，请使用 CreateBashSession（会话 API）。
+//
+// 参数:
+//   - req: 创建上下文请求
+//
+// 返回值:
+//   - string: 会话 ID
+//   - error: 创建错误（如有）
 func (c *Controller) CreateContext(req *CreateContextRequest) (string, error) {
-	// Create a new Jupyter session.
 	var (
 		client  *jupyter.Client
 		session *jupytersession.Session
 		err     error
 	)
 
+	// 使用重试机制创建 Jupyter 会话
 	err = retry.OnError(kernelWaitingBackoff, func(err error) bool {
 		log.Error("failed to create session, retrying: %v", err)
 		return err != nil
@@ -51,6 +137,7 @@ func (c *Controller) CreateContext(req *CreateContextRequest) (string, error) {
 		return "", err
 	}
 
+	// 存储内核信息
 	kernel := &jupyterKernel{
 		kernelID: session.Kernel.ID,
 		client:   client,
@@ -58,6 +145,7 @@ func (c *Controller) CreateContext(req *CreateContextRequest) (string, error) {
 	}
 	c.storeJupyterKernel(session.ID, kernel)
 
+	// 设置工作目录
 	err = c.setWorkingDir(kernel, req)
 	if err != nil {
 		return "", fmt.Errorf("failed to setup working dir: %w", err)
@@ -66,10 +154,12 @@ func (c *Controller) CreateContext(req *CreateContextRequest) (string, error) {
 	return session.ID, nil
 }
 
+// DeleteContext 删除会话并清理资源
 func (c *Controller) DeleteContext(session string) error {
 	return c.deleteSessionAndCleanup(session)
 }
 
+// GetContext 获取指定会话的上下文信息
 func (c *Controller) GetContext(session string) (CodeContext, error) {
 	kernel := c.getJupyterKernel(session)
 	if kernel == nil {
@@ -81,6 +171,7 @@ func (c *Controller) GetContext(session string) (CodeContext, error) {
 	}, nil
 }
 
+// ListContext 列出指定语言的所有上下文
 func (c *Controller) ListContext(language string) ([]CodeContext, error) {
 	switch language {
 	case Command.String(), BackgroundCommand.String(), SQL.String():
@@ -92,6 +183,7 @@ func (c *Controller) ListContext(language string) ([]CodeContext, error) {
 	}
 }
 
+// DeleteLanguageContext 删除指定语言的所有上下文
 func (c *Controller) DeleteLanguageContext(language Language) error {
 	contexts, err := c.listLanguageContexts(language)
 	if err != nil {
@@ -112,6 +204,7 @@ func (c *Controller) DeleteLanguageContext(language Language) error {
 	return nil
 }
 
+// deleteSessionAndCleanup 删除会话并清理相关资源
 func (c *Controller) deleteSessionAndCleanup(session string) error {
 	if c.getJupyterKernel(session) == nil {
 		return ErrContextNotFound
@@ -124,10 +217,12 @@ func (c *Controller) deleteSessionAndCleanup(session string) error {
 	return nil
 }
 
+// newContextID 生成新的上下文 ID
 func (c *Controller) newContextID() string {
 	return strings.ReplaceAll(uuid.New().String(), "-", "")
 }
 
+// newIpynbPath 创建新的 notebook 文件路径
 func (c *Controller) newIpynbPath(sessionID, cwd string) (string, error) {
 	if cwd != "" {
 		err := os.MkdirAll(cwd, os.ModePerm)
@@ -135,11 +230,10 @@ func (c *Controller) newIpynbPath(sessionID, cwd string) (string, error) {
 			return "", err
 		}
 	}
-
 	return filepath.Join(cwd, fmt.Sprintf("%s.ipynb", sessionID)), nil
 }
 
-// createDefaultLanguageJupyterContext prewarms a session for stateless execution.
+// createDefaultLanguageJupyterContext 为无状态执行预热默认语言会话
 func (c *Controller) createDefaultLanguageJupyterContext(language Language) error {
 	if c.getDefaultLanguageSession(language) != "" {
 		return nil
@@ -173,7 +267,7 @@ func (c *Controller) createDefaultLanguageJupyterContext(language Language) erro
 	return nil
 }
 
-// createJupyterContext performs the actual context creation workflow.
+// createJupyterContext 执行实际的上下文创建流程
 func (c *Controller) createJupyterContext(request CreateContextRequest) (*jupyter.Client, *jupytersession.Session, error) {
 	client := c.jupyterClient()
 
@@ -212,11 +306,12 @@ func (c *Controller) createJupyterContext(request CreateContextRequest) (*jupyte
 	return client, jupyterSession, nil
 }
 
-// storeJupyterKernel caches a session -> kernel mapping.
+// storeJupyterKernel 缓存会话到内核的映射
 func (c *Controller) storeJupyterKernel(sessionID string, kernel *jupyterKernel) {
 	c.jupyterClientMap.Store(sessionID, kernel)
 }
 
+// jupyterClient 创建带认证的 Jupyter 客户端
 func (c *Controller) jupyterClient() *jupyter.Client {
 	httpClient := &http.Client{
 		Transport: &jupyter.AuthTransport{
@@ -224,12 +319,12 @@ func (c *Controller) jupyterClient() *jupyter.Client {
 			Base:  http.DefaultTransport,
 		},
 	}
-
 	return jupyter.NewClient(c.baseURL,
 		jupyter.WithToken(c.token),
 		jupyter.WithHTTPClient(httpClient))
 }
 
+// getDefaultLanguageSession 获取指定语言的默认会话 ID
 func (c *Controller) getDefaultLanguageSession(language Language) string {
 	if v, ok := c.defaultLanguageSessions.Load(language); ok {
 		if session, ok := v.(string); ok {
@@ -239,10 +334,12 @@ func (c *Controller) getDefaultLanguageSession(language Language) string {
 	return ""
 }
 
+// setDefaultLanguageSession 设置指定语言的默认会话 ID
 func (c *Controller) setDefaultLanguageSession(language Language, sessionID string) {
 	c.defaultLanguageSessions.Store(language, sessionID)
 }
 
+// deleteDefaultSessionByID 根据会话 ID 删除默认会话记录
 func (c *Controller) deleteDefaultSessionByID(sessionID string) {
 	c.defaultLanguageSessions.Range(func(key, value any) bool {
 		if s, ok := value.(string); ok && s == sessionID {
@@ -252,6 +349,7 @@ func (c *Controller) deleteDefaultSessionByID(sessionID string) {
 	})
 }
 
+// listAllContexts 列出所有上下文
 func (c *Controller) listAllContexts() ([]CodeContext, error) {
 	contexts := make([]CodeContext, 0)
 	c.jupyterClientMap.Range(func(key, value any) bool {
@@ -275,6 +373,7 @@ func (c *Controller) listAllContexts() ([]CodeContext, error) {
 	return contexts, nil
 }
 
+// listLanguageContexts 列出指定语言的所有上下文
 func (c *Controller) listLanguageContexts(language Language) ([]CodeContext, error) {
 	contexts := make([]CodeContext, 0)
 	c.jupyterClientMap.Range(func(key, value any) bool {

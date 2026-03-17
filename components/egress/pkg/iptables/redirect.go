@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// iptables 规则配置。
+//
+// 本文件实现 iptables 规则配置，用于将 DNS 流量重定向到本地代理。
 package iptables
 
 import (
@@ -24,14 +27,28 @@ import (
 	"github.com/alibaba/opensandbox/egress/pkg/log"
 )
 
-// SetupRedirect installs OUTPUT nat redirect for DNS (udp/tcp 53 -> port).
+// SetupRedirect 配置 iptables DNS 重定向规则。
 //
-// exemptDst: optional list of destination IPs; traffic to these is not redirected. Packets carrying mark are also RETURNed (proxy's own upstream). Requires CAP_NET_ADMIN.
+// 该函数安装以下规则：
+// 1. 为每个 exempt 目标 IP 添加 RETURN 规则（IPv4 和 IPv6）
+// 2. 为标记的数据包添加 RETURN 规则（代理自身发出的 DNS 查询）
+// 3. 将所有其他 DNS 流量重定向到本地代理端口
+//
+// 需要 CAP_NET_ADMIN 能力。
+//
+// 参数：
+//   port: 重定向目标端口（代理监听端口）
+//   exemptDst: 豁免的目标 IP 列表；发往这些 IP 的流量不会被重定向
+//
+// 返回：
+//   配置错误（如有）
 func SetupRedirect(port int, exemptDst []netip.Addr) error {
 	log.Infof("installing iptables DNS redirect: OUTPUT port 53 -> %d (mark %s bypass)", port, constants.MarkHex)
 	targetPort := strconv.Itoa(port)
 
 	var rules [][]string
+
+	// 为每个 exempt 目标添加 RETURN 规则
 	for _, d := range exemptDst {
 		addr := d
 		dStr := d.String()
@@ -47,21 +64,25 @@ func SetupRedirect(port int, exemptDst []netip.Addr) error {
 			)
 		}
 	}
-	// Bypass packets marked by the proxy itself (see dnsproxy dialer).
+
+	// 标记并重定向规则
 	markAndRedirect := [][]string{
+		// IPv4: 标记的数据包 RETURN（代理自身发出的 DNS 查询）
 		{"iptables", "-t", "nat", "-A", "OUTPUT", "-p", "udp", "--dport", "53", "-m", "mark", "--mark", constants.MarkHex, "-j", "RETURN"},
 		{"iptables", "-t", "nat", "-A", "OUTPUT", "-p", "tcp", "--dport", "53", "-m", "mark", "--mark", constants.MarkHex, "-j", "RETURN"},
-		// Redirect all other DNS traffic to local proxy port.
+		// IPv4: 重定向其他 DNS 流量到代理
 		{"iptables", "-t", "nat", "-A", "OUTPUT", "-p", "udp", "--dport", "53", "-j", "REDIRECT", "--to-port", targetPort},
 		{"iptables", "-t", "nat", "-A", "OUTPUT", "-p", "tcp", "--dport", "53", "-j", "REDIRECT", "--to-port", targetPort},
-		// IPv6 equivalents (ip6tables)
+		// IPv6: 标记的数据包 RETURN
 		{"ip6tables", "-t", "nat", "-A", "OUTPUT", "-p", "udp", "--dport", "53", "-m", "mark", "--mark", constants.MarkHex, "-j", "RETURN"},
 		{"ip6tables", "-t", "nat", "-A", "OUTPUT", "-p", "tcp", "--dport", "53", "-m", "mark", "--mark", constants.MarkHex, "-j", "RETURN"},
+		// IPv6: 重定向其他 DNS 流量到代理
 		{"ip6tables", "-t", "nat", "-A", "OUTPUT", "-p", "udp", "--dport", "53", "-j", "REDIRECT", "--to-port", targetPort},
 		{"ip6tables", "-t", "nat", "-A", "OUTPUT", "-p", "tcp", "--dport", "53", "-j", "REDIRECT", "--to-port", targetPort},
 	}
 	rules = append(rules, markAndRedirect...)
 
+	// 执行所有 iptables 命令
 	for _, args := range rules {
 		if output, err := exec.Command(args[0], args[1:]...).CombinedOutput(); err != nil {
 			return fmt.Errorf("iptables command failed: %v (output: %s)", err, output)

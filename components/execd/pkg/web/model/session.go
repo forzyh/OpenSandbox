@@ -18,24 +18,50 @@ import (
 	"github.com/go-playground/validator/v10"
 )
 
-// CreateSessionRequest is the request body for creating a bash session.
+// CreateSessionRequest 表示创建 Bash 会话的请求
+//
+// CreateSessionRequest 用于客户端向服务器请求创建一个新的 Bash 会话。
+// Bash 会话是一个持久的 shell 环境，支持有状态的命令执行。
 type CreateSessionRequest struct {
+	// Cwd 会话的初始工作目录（可选）
+	// 空字符串表示使用默认工作目录
 	Cwd string `json:"cwd,omitempty"`
 }
 
-// CreateSessionResponse is the response for create_session.
+// CreateSessionResponse 表示创建会话的响应
+//
+// CreateSessionResponse 是服务器在成功创建 Bash 会话后返回的响应，
+// 包含新创建的会话 ID。
 type CreateSessionResponse struct {
+	// SessionID 新创建的会话 ID
+	// 客户端可以使用此 ID 在会话中执行命令
 	SessionID string `json:"session_id"`
 }
 
-// RunInSessionRequest is the request body for running code in an existing session.
+// RunInSessionRequest 表示在现有会话中执行代码的请求
+//
+// RunInSessionRequest 用于客户端向服务器发送在已存在的 Bash 会话
+// 中执行代码的请求。会话必须已经通过 CreateSessionRequest 创建。
 type RunInSessionRequest struct {
-	Code      string `json:"code" validate:"required"`
-	Cwd       string `json:"cwd,omitempty"`
-	TimeoutMs int64  `json:"timeout_ms,omitempty" validate:"omitempty,gte=0"`
+	// Code 要执行的代码（必填）
+	Code string `json:"code" validate:"required"`
+
+	// Cwd 命令执行的工作目录（可选）
+	// 空字符串表示使用会话的当前工作目录
+	Cwd string `json:"cwd,omitempty"`
+
+	// TimeoutMs 执行超时时间（毫秒）
+	// 0 表示使用服务器默认超时时间
+	TimeoutMs int64 `json:"timeout_ms,omitempty" validate:"omitempty,gte=0"`
 }
 
-// Validate validates RunInSessionRequest.
+// Validate 验证请求的有效性
+//
+// 本方法使用 validator 库验证请求结构体的字段，
+// 确保必填字段已提供且格式正确。
+//
+// 返回值:
+//   - error: 验证错误（如有）
 func (r *RunInSessionRequest) Validate() error {
 	validate := validator.New()
 	return validate.Struct(r)

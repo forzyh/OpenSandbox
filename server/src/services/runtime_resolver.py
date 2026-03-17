@@ -13,12 +13,18 @@
 # limitations under the License.
 
 """
-Secure runtime resolver for translating secure runtime configuration
-to backend-specific parameters (Docker --runtime, Kubernetes RuntimeClass).
+安全运行时配置解析器模块。
 
-This module provides:
-- SecureRuntimeResolver: Translates AppConfig to runtime parameters
-- validate_secure_runtime_on_startup: Validates runtime availability at server startup
+本模块用于将安全运行时配置转换为后端特定的参数：
+- Docker：OCI 运行时名称（如 "runsc"、"kata-runtime"）
+- Kubernetes：RuntimeClass 名称（如 "gvisor"、"kata-qemu"）
+
+主要功能：
+- SecureRuntimeResolver 类：将 AppConfig 转换为运行时参数
+- validate_secure_runtime_on_startup 函数：在服务器启动时验证运行时可用性
+
+安全运行时（Secure Runtime）是一种容器隔离技术，如 Google 的 gVisor
+或 Intel 的 Kata Containers，它们提供比传统容器更强的安全隔离。
 """
 
 from __future__ import annotations
@@ -39,40 +45,65 @@ if TYPE_CHECKING:
 
 class SecureRuntimeResolver:
     """
-    Resolver for secure container runtime configuration.
+    安全容器运行时配置解析器。
 
-    Translates server-level secure_runtime configuration into
-    backend-specific parameters:
-    - Docker: OCI runtime name (e.g., "runsc", "kata-runtime")
-    - Kubernetes: RuntimeClass name (e.g., "gvisor", "kata-qemu")
+    将服务器级别的安全运行时配置转换为后端特定的参数：
+    - Docker：OCI 运行时名称（如 "runsc"、"kata-runtime"）
+    - Kubernetes：RuntimeClass 名称（如 "gvisor"、"kata-qemu"）
+
+    支持的运行时类型：
+    - gvisor：Google 开发的容器沙箱，提供系统调用级别的隔离
+    - kata：Intel 开发的轻量级虚拟机容器，提供硬件级别的隔离
+    - firecracker：AWS 开发的基于 MicroVM 的隔离技术
+
+    Attributes:
+        secure_runtime: 安全运行时配置
+        runtime_mode: 运行时模式（"docker" 或 "kubernetes"）
     """
 
-    # Default runtime mappings
+    # 默认 Docker 运行时映射表
+    # 将运行时类型映射到具体的 OCI 运行时名称
     DEFAULT_DOCKER_RUNTIMES = {
-        "gvisor": "runsc",
-        "kata": "kata-runtime",
+        "gvisor": "runsc",       # gVisor 使用 runsc 运行时
+        "kata": "kata-runtime",  # Kata Containers 使用 kata-runtime
     }
 
+    # 默认 Kubernetes RuntimeClass 映射表
+    # 将运行时类型映射到具体的 RuntimeClass 名称
     DEFAULT_K8S_RUNTIME_CLASSES = {
-        "gvisor": "gvisor",
-        "kata": "kata-qemu",
-        "firecracker": "kata-fc",
+        "gvisor": "gvisor",      # gVisor 的 RuntimeClass
+        "kata": "kata-qemu",     # Kata Containers 使用 QEMU 后端
+        "firecracker": "kata-fc", # Kata Containers 使用 Firecracker 后端
     }
 
     def __init__(self, config: AppConfig):
         """
-        Initialize the resolver with application configuration.
+        使用应用配置初始化解析器。
 
         Args:
-            config: Application configuration containing secure_runtime settings
+            config: 应用配置，包含 secure_runtime 设置
+
+        Examples:
+            >>> resolver = SecureRuntimeResolver(app_config)
+            >>> if resolver.is_enabled():
+            ...     runtime = resolver.get_docker_runtime()
         """
         self.secure_runtime: Optional[SecureRuntimeConfig] = getattr(
             config, "secure_runtime", None
         )
-        self.runtime_mode = config.runtime.type  # "docker" or "kubernetes"
+        self.runtime_mode = config.runtime.type  # "docker" 或 "kubernetes"
 
     def is_enabled(self) -> bool:
-        """Check if secure runtime is configured and enabled."""
+        """
+        检查是否配置并启用了安全运行时。
+
+        Returns:
+            bool: 如果配置了安全运行时且类型不为空则返回 True
+
+        Examples:
+            >>> resolver.is_enabled()
+            True
+        """
         return (
             self.secure_runtime is not None
             and self.secure_runtime.type != ""
@@ -80,13 +111,22 @@ class SecureRuntimeResolver:
 
     def get_docker_runtime(self) -> Optional[str]:
         """
-        Get the Docker OCI runtime name for secure containers.
+        获取安全容器的 Docker OCI 运行时名称。
 
-        Returns the configured docker_runtime if set, otherwise uses
-        the default mapping for the secure runtime type.
+        如果配置了 docker_runtime 则返回配置值，否则使用
+        安全运行时类型的默认映射。
 
         Returns:
-            OCI runtime name (e.g., "runsc", "kata-runtime") or None
+            str: OCI 运行时名称（如 "runsc"、"kata-runtime"）
+            None: 如果未启用安全运行时
+
+        Examples:
+            >>> # 配置了 gvisor 类型，未指定 docker_runtime
+            >>> resolver.get_docker_runtime()
+            'runsc'
+            >>> # 配置了显式的 docker_runtime
+            >>> resolver.get_docker_runtime()
+            'custom-runtime'
         """
         if not self.is_enabled():
             return None
@@ -94,23 +134,32 @@ class SecureRuntimeResolver:
         if self.secure_runtime is None:
             return None
 
-        # Use explicit docker_runtime if configured
+        # 如果配置了显式的 docker_runtime，优先使用
         if self.secure_runtime.docker_runtime:
             return self.secure_runtime.docker_runtime
 
-        # Fall back to default mapping
+        # 否则使用默认映射
         runtime_type = self.secure_runtime.type
         return self.DEFAULT_DOCKER_RUNTIMES.get(runtime_type)
 
     def get_k8s_runtime_class(self) -> Optional[str]:
         """
-        Get the Kubernetes RuntimeClass name for secure containers.
+        获取安全容器的 Kubernetes RuntimeClass 名称。
 
-        Returns the configured k8s_runtime_class if set, otherwise uses
-        the default mapping for the secure runtime type.
+        如果配置了 k8s_runtime_class 则返回配置值，否则使用
+        安全运行时类型的默认映射。
 
         Returns:
-            RuntimeClass name (e.g., "gvisor", "kata-qemu") or None
+            str: RuntimeClass 名称（如 "gvisor"、"kata-qemu"）
+            None: 如果未启用安全运行时
+
+        Examples:
+            >>> # 配置了 gvisor 类型，未指定 k8s_runtime_class
+            >>> resolver.get_k8s_runtime_class()
+            'gvisor'
+            >>> # 配置了显式的 k8s_runtime_class
+            >>> resolver.get_k8s_runtime_class()
+            'custom-runtime-class'
         """
         if not self.is_enabled():
             return None
@@ -118,11 +167,11 @@ class SecureRuntimeResolver:
         if self.secure_runtime is None:
             return None
 
-        # Use explicit k8s_runtime_class if configured
+        # 如果配置了显式的 k8s_runtime_class，优先使用
         if self.secure_runtime.k8s_runtime_class:
             return self.secure_runtime.k8s_runtime_class
 
-        # Fall back to default mapping
+        # 否则使用默认映射
         runtime_type = self.secure_runtime.type
         return self.DEFAULT_K8S_RUNTIME_CLASSES.get(runtime_type)
 
@@ -133,26 +182,30 @@ async def validate_secure_runtime_on_startup(
     k8s_client: Optional["K8sClient"] = None,
 ) -> None:
     """
-    Validate that configured secure runtimes are available at startup.
+    在启动时验证配置的安全运行时是否可用。
 
-    This function performs fail-fast validation to ensure the server
-    starts with a valid secure runtime configuration. It checks:
-    - Docker runtimes: Verifies the runtime exists in Docker daemon
-    - Kubernetes RuntimeClasses: Verifies the RuntimeClass exists in cluster
+    本函数执行故障快速检测（fail-fast）验证，确保服务器
+    以有效的安全运行时配置启动。验证内容：
+    - Docker 运行时：验证运行时是否存在于 Docker 守护进程中
+    - Kubernetes RuntimeClass：验证 RuntimeClass 是否存在于集群中
 
     Args:
-        config: Application configuration
-        docker_client: Optional Docker client for runtime validation
-        k8s_client: Optional K8s client wrapper for RuntimeClass validation
+        config: 应用配置
+        docker_client: 用于运行时验证的 Docker 客户端（可选）
+        k8s_client: 用于 RuntimeClass 验证的 K8s 客户端包装器（可选）
 
     Raises:
-        ValueError: If a configured secure runtime is not available
-        Exception: For other validation errors
+        ValueError: 如果配置的安全运行时不可用
+        Exception: 其他验证错误
+
+    Examples:
+        >>> await validate_secure_runtime_on_startup(config, docker_client)
+        # 如果运行时不可用，将抛出 ValueError
     """
     resolver = SecureRuntimeResolver(config)
 
     if not resolver.is_enabled():
-        logger.info("Secure runtime is not configured.")
+        logger.info("未配置安全运行时。")
         return
 
     if config.runtime.type == "docker":
@@ -161,7 +214,7 @@ async def validate_secure_runtime_on_startup(
         await _validate_k8s_runtime_class(resolver, k8s_client, config)
     else:
         logger.warning(
-            "Secure runtime validation skipped for unknown runtime type: %s",
+            "跳过了未知运行时类型的安全运行时验证：%s",
             config.runtime.type,
         )
 
@@ -170,44 +223,55 @@ async def _validate_docker_runtime(
     resolver: SecureRuntimeResolver,
     docker_client: Optional["DockerClient"],
 ) -> None:
-    """Validate that the Docker OCI runtime exists."""
+    """
+    验证 Docker OCI 运行时是否存在。
+
+    通过检查 Docker 守护进程的运行时列表来验证配置的运行时是否可用。
+
+    Args:
+        resolver: 安全运行时解析器
+        docker_client: Docker 客户端
+
+    Raises:
+        ValueError: 如果配置的运行时不可用
+    """
     runtime_name = resolver.get_docker_runtime()
 
     if not runtime_name:
-        logger.info("No Docker runtime configured for secure containers.")
+        logger.info("未配置安全容器的 Docker 运行时。")
         return
 
-    logger.info("Validating Docker OCI runtime: %s", runtime_name)
+    logger.info("验证 Docker OCI 运行时：%s", runtime_name)
 
     if docker_client is None:
         logger.warning(
-            "Docker client not available; skipping runtime validation. "
-            "Runtime '%s' will be used but not validated.",
+            "Docker 客户端不可用；跳过运行时验证。"
+            "运行时 '%s' 将被使用但不会被验证。",
             runtime_name,
         )
         return
 
     try:
-        # Get list of available runtimes from Docker daemon
-        # Docker stores runtimes in daemon configuration
+        # 从 Docker 守护进程获取可用运行时列表
+        # Docker 将运行时存储在守护进程配置中
         info = docker_client.info()
         runtimes = info.get("Runtimes", {})
 
         if runtime_name not in runtimes:
-            available = ", ".join(runtimes.keys()) if runtimes else "none"
+            available = ", ".join(runtimes.keys()) if runtimes else "无"
             raise ValueError(
-                f"Configured Docker runtime '{runtime_name}' is not available. "
-                f"Available runtimes: {available}. "
-                f"Please install and configure the runtime before starting the server."
+                f"配置的 Docker 运行时 '{runtime_name}' 不可用。"
+                f"可用的运行时：{available}。"
+                f"请在启动服务器之前安装并配置该运行时。"
             )
 
         logger.info(
-            "Docker OCI runtime '%s' is available: %s",
+            "Docker OCI 运行时 '%s' 可用：%s",
             runtime_name,
             runtimes.get(runtime_name, {}),
         )
     except Exception as exc:
-        logger.error("Failed to validate Docker runtime: %s", exc)
+        logger.error("验证 Docker 运行时失败：%s", exc)
         raise
 
 
@@ -216,37 +280,51 @@ async def _validate_k8s_runtime_class(
     k8s_client: Optional["K8sClient"],
     config: AppConfig,
 ) -> None:
-    """Validate that the Kubernetes RuntimeClass exists."""
+    """
+    验证 Kubernetes RuntimeClass 是否存在。
+
+    通过查询 Kubernetes API 来验证配置的 RuntimeClass 是否存在。
+
+    Args:
+        resolver: 安全运行时解析器
+        k8s_client: K8s 客户端包装器
+        config: 应用配置
+
+    Raises:
+        ValueError: 如果配置的 RuntimeClass 不存在
+        ApiException: Kubernetes API 错误
+    """
     runtime_class_name = resolver.get_k8s_runtime_class()
 
     if not runtime_class_name:
-        logger.info("No Kubernetes RuntimeClass configured for secure containers.")
+        logger.info("未配置安全容器的 Kubernetes RuntimeClass。")
         return
 
-    logger.info("Validating Kubernetes RuntimeClass: %s", runtime_class_name)
+    logger.info("验证 Kubernetes RuntimeClass：%s", runtime_class_name)
 
     if k8s_client is None:
         logger.warning(
-            "Kubernetes client not available; skipping RuntimeClass validation. "
-            "RuntimeClass '%s' will be used but not validated.",
+            "Kubernetes 客户端不可用；跳过 RuntimeClass 验证。"
+            "RuntimeClass '%s' 将被使用但不会被验证。",
             runtime_class_name,
         )
         return
 
     try:
         loop = asyncio.get_event_loop()
+        # 在线程池中运行同步 API 调用
         await loop.run_in_executor(None, k8s_client.read_runtime_class, runtime_class_name)
-        logger.info("Kubernetes RuntimeClass '%s' is available.", runtime_class_name)
+        logger.info("Kubernetes RuntimeClass '%s' 可用。", runtime_class_name)
     except ApiException as exc:
         if exc.status == 404:
             raise ValueError(
-                f"Configured Kubernetes RuntimeClass '{runtime_class_name}' does not exist. "
-                f"Please create the RuntimeClass before starting the server."
+                f"配置的 Kubernetes RuntimeClass '{runtime_class_name}' 不存在。"
+                f"请在启动服务器之前创建该 RuntimeClass。"
             ) from exc
-        logger.error("Failed to validate RuntimeClass: %s", exc)
+        logger.error("验证 RuntimeClass 失败：%s", exc)
         raise
     except Exception as exc:
-        logger.error("Failed to validate RuntimeClass: %s", exc)
+        logger.error("验证 RuntimeClass 失败：%s", exc)
         raise
 
 

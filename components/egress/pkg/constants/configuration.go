@@ -12,30 +12,21 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// 常量定义包 - 底层配置。
+//
+// 本文件定义了 Egress 组件使用的底层常量和配置值。
 package constants
 
 const (
-	EnvBlockDoH443    = "OPENSANDBOX_EGRESS_BLOCK_DOH_443"
-	EnvDoHBlocklist   = "OPENSANDBOX_EGRESS_DOH_BLOCKLIST" // comma-separated IP/CIDR
-	EnvEgressMode     = "OPENSANDBOX_EGRESS_MODE"          // dns | dns+nft
-	EnvEgressHTTPAddr = "OPENSANDBOX_EGRESS_HTTP_ADDR"
-	EnvEgressToken    = "OPENSANDBOX_EGRESS_TOKEN"
-	EnvEgressRules    = "OPENSANDBOX_EGRESS_RULES"
-	EnvEgressLogLevel = "OPENSANDBOX_EGRESS_LOG_LEVEL"
-	EnvMaxNameservers = "OPENSANDBOX_EGRESS_MAX_NS"
-	EnvBlockedWebhook = "OPENSANDBOX_EGRESS_DENY_WEBHOOK"
-	ENVSandboxID      = "OPENSANDBOX_EGRESS_SANDBOX_ID"
+	// MarkValue: iptables/nftables 使用的 SO_MARK 值
+	// 用于标记代理发出的 DNS 查询流量，使其绕过 DNS 重定向
+	MarkValue = 0x1
 
-	// EnvNameserverExempt comma-separated IPs; proxy upstream to these is not marked and is allowed in nft allow set
-	EnvNameserverExempt = "OPENSANDBOX_EGRESS_NAMESERVER_EXEMPT"
+	// MarkHex: Mark 值的十六进制字符串表示
+	MarkHex = "0x1"
 )
 
 const (
-	PolicyDnsOnly = "dns"
-	PolicyDnsNft  = "dns+nft"
-)
-
-const (
-	DefaultEgressServerAddr = ":18080"
-	DefaultMaxNameservers   = 3
+	// EgressAuthTokenHeader: HTTP 策略服务器认证头名称
+	EgressAuthTokenHeader = "OPENSANDBOX-EGRESS-AUTH"
 )

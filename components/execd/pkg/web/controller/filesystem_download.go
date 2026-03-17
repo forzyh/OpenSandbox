@@ -25,7 +25,10 @@ import (
 	"github.com/alibaba/opensandbox/execd/pkg/web/model"
 )
 
-// DownloadFile serves a file for download with support for range requests.
+// DownloadFile 提供文件下载（支持 Range 请求）
+//
+// 本接口允许客户端下载指定路径的文件。
+// 支持 HTTP Range 请求，可实现断点续传。
 func (c *FilesystemController) DownloadFile() {
 	filePath := c.ctx.Query("path")
 	if filePath == "" {
@@ -54,10 +57,12 @@ func (c *FilesystemController) DownloadFile() {
 		return
 	}
 
+	// 设置响应头
 	c.ctx.Header("Content-Type", "application/octet-stream")
 	c.ctx.Header("Content-Disposition", "attachment; filename="+filepath.Base(filePath))
 	c.ctx.Header("Content-Length", strconv.FormatInt(fileInfo.Size(), 10))
 
+	// 处理 Range 请求
 	if rangeHeader := c.ctx.GetHeader("Range"); rangeHeader != "" {
 		ranges, err := ParseRange(rangeHeader, fileInfo.Size())
 		if err != nil {

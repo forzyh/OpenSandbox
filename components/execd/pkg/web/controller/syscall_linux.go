@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//go:build linux
+//gogo:build linux
 // +build linux
 
 package controller
@@ -23,6 +23,16 @@ import (
 	"time"
 )
 
+// getFileCreateTime 获取文件的创建时间（Linux 版本）
+//
+// 本函数从 Linux stat 结构体中读取文件创建时间。
+// 如果无法获取创建时间，则返回修改时间作为回退。
+//
+// 参数:
+//   - fileInfo: 文件信息
+//
+// 返回值:
+//   - time.Time: 文件创建时间
 func getFileCreateTime(fileInfo os.FileInfo) time.Time {
 	stat, ok := fileInfo.Sys().(*syscall.Stat_t)
 	if !ok || stat == nil {

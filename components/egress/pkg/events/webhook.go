@@ -12,6 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Webhook 订阅者实现。
+//
+// 本文件实现了 WebhookSubscriber，用于将被拒绝的域名事件
+// 通过 HTTP POST 发送到配置的 webhook 端点。
 package events
 
 import (
@@ -28,31 +32,39 @@ import (
 	"github.com/alibaba/opensandbox/egress/pkg/log"
 )
 
+// Webhook 配置常量
 const (
-	webhookSource         = "opensandbox-egress"
-	defaultWebhookTimeout = 5 * time.Second
-	defaultWebhookRetries = 3
-	defaultWebhookBackoff = 1 * time.Second
+	webhookSource         = "opensandbox-egress" // 事件来源标识
+	defaultWebhookTimeout = 5 * time.Second      // 默认请求超时
+	defaultWebhookRetries = 3                    // 默认重试次数
+	defaultWebhookBackoff = 1 * time.Second      // 默认退避时间
 )
 
-// WebhookSubscriber delivers blocked events to an HTTP endpoint.
+// WebhookSubscriber 将被拒绝事件发送到 HTTP 端点。
 type WebhookSubscriber struct {
-	url        string
-	client     *http.Client
-	timeout    time.Duration
-	maxRetries int
-	backoff    time.Duration
-	sandboxID  string
+	url        string       // webhook URL
+	client     *http.Client // HTTP 客户端
+	timeout    time.Duration // 请求超时
+	maxRetries int          // 最大重试次数
+	backoff    time.Duration // 退避时间
+	sandboxID  string       // 沙盒 ID（从环境变量获取）
 }
 
+// webhookPayload Webhook 请求体结构。
 type webhookPayload struct {
-	Hostname  string `json:"hostname"`
-	Timestamp string `json:"timestamp"`
-	Source    string `json:"source"`
-	SandboxID string `json:"sandboxId"`
+	Hostname  string `json:"hostname"`  // 被拒绝的域名
+	Timestamp string `json:"timestamp"` // 时间戳（RFC3339 格式）
+	Source    string `json:"source"`    // 事件来源
+	SandboxID string `json:"sandboxId"` // 沙盒 ID
 }
 
-// NewWebhookSubscriber builds a webhook subscriber with hardcoded timeout/retry settings.
+// NewWebhookSubscriber 创建 Webhook 订阅者实例。
+//
+// 参数：
+//   url: webhook URL
+//
+// 返回：
+//   Webhook 订阅者实例（url 为空时返回 nil）
 func NewWebhookSubscriber(url string) *WebhookSubscriber {
 	if url == "" {
 		return nil
@@ -67,7 +79,17 @@ func NewWebhookSubscriber(url string) *WebhookSubscriber {
 	}
 }
 
-// HandleBlocked sends the blocked event to the configured webhook with retries.
+// HandleBlocked 发送被拒绝事件到配置的 webhook，带重试。
+//
+// 重试策略：
+// - 最多重试 maxRetries 次
+// - 每次重试使用指数退避（backoff * 2^attempt）
+// - 4xx 错误不重试（非可重试错误）
+// - 5xx 错误和网络错误会重试
+//
+// 参数：
+//   ctx: 上下文
+//   ev: 被拒绝事件
 func (w *WebhookSubscriber) HandleBlocked(ctx context.Context, ev BlockedEvent) {
 	payload := webhookPayload{
 		Hostname:  ev.Hostname,
@@ -102,20 +124,24 @@ func (w *WebhookSubscriber) HandleBlocked(ctx context.Context, ev BlockedEvent) 
 			_, _ = io.Copy(io.Discard, resp.Body)
 			_ = resp.Body.Close()
 			if resp.StatusCode < 300 {
+				// 成功
 				cancel()
 				return
 			}
 			if resp.StatusCode < 500 {
+				// 4xx 错误，不重试
 				cancel()
 				log.Warnf("[webhook] non-retriable status %d for hostname %s", resp.StatusCode, payload.Hostname)
 				return
 			}
+			// 5xx 错误，记录错误继续重试
 			err = fmt.Errorf("status %d", resp.StatusCode)
 		}
 
 		cancel()
 		lastErr = err
 		if attempt < w.maxRetries {
+			// 指数退避
 			time.Sleep(w.backoff * time.Duration(1<<attempt))
 		}
 	}

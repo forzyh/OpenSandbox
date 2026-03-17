@@ -14,6 +14,9 @@
 
 //go:build !linux
 
+// 非 Linux 平台的 DNS 代理实现。
+//
+// 非 Linux 平台不支持 SO_MARK，返回基本拨号器。
 package dnsproxy
 
 import (
@@ -21,7 +24,7 @@ import (
 	"time"
 )
 
-// Non-linux: no SO_MARK; return basic dialer.
+// dialerWithMark 非 Linux 平台：无 SO_MARK，返回基本拨号器。
 func (p *Proxy) dialerWithMark() *net.Dialer {
 	return &net.Dialer{Timeout: 5 * time.Second}
 }
